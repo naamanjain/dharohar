@@ -1,0 +1,25 @@
+# --- Build context exclusions for Dockerfile.api and Dockerfile.web ---
+node_modules
+**/node_modules
+dist
+dist-server
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+*.log
+npm-debug.log*
+coverage
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+# Local artefacts not needed inside either image
+README.md
+docker-compose*.yml
+Dockerfile.*
+.dockerignore
+# NOTE: public/ is deliberately NOT ignored. It holds the self-hosted Tesseract assets
+# (public/tesseract/) that Vite copies into dist/ and that Dockerfile.web asserts are
+# present. Ignoring it would silently re-introduce a CDN dependency at runtime.

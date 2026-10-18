@@ -1,0 +1,27 @@
+node_modules/
+build/
+dist/
+dist-server/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Database dumps and their checksum sidecars. A dump is the whole land-records table set —
+# parcels, owners, documents, OCR text and the audit chain — in one file. It must never be
+# committed, and the pre-upgrade backups this project writes are named to make that obvious.
+backups/
+backups-*/
+*.dump
+*.pgdump
+*.sha256
+
+# Scratch working files and one-off probes.
+tmp/
+*.bak
+*.orig
+
+# Editor / tool state that is not part of the application.
+.vscode/
+.idea/

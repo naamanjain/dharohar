@@ -1,0 +1,39 @@
+# GitGuardian / secret-scanner configuration.
+#
+# Why this file exists: the repository legitimately contains high-entropy strings that are not
+# credentials, and a scanner cannot tell them apart by looking. Each exclusion below is a claim about
+# a class of file, with the reason stated, so a future reader can check the claim instead of trusting
+# it. Nothing here hides a secret: the vendored OCR binaries and the lockfile integrity hashes were
+# already verifiable as non-credentials, and every other path in the repository stays scanned.
+version: "2"
+
+exclude_paths:
+  # Vendored Tesseract WASM and language models. Committed deliberately — the app fetches OCR from
+  # its own origin instead of a CDN, so the runtime works offline and cannot be broken by a third
+  # party's outage. These are compiled binaries: minified loader lines are base64 blobs of wasm
+  # bytecode, which is precisely what a "Generic High Entropy Secret" detector keys on.
+  # Verify provenance and integrity: public/tesseract/PROVENANCE.md records upstream versions,
+  # licence and the sha256 of each file as fetched.
+  - public/tesseract/**
+
+  # npm's own integrity records. sha512 digests of published tarballs, machine-generated, rotated on
+  # every install; they are checksums of public artefacts, not secrets.
+  - package-lock.json
+  - bun.lock
+
+  # Generated build output.
+  - dist/**
+  - dist-server/**
+
+# The one deliberate exception inside scanned code, kept narrow on purpose.
+#
+# server/src/config/env.ts refuses to start with the JWT signing secret that shipped in the original
+# prototype and was published in its README. It stores a SHA-256 digest of that value to compare
+# against, so the secret itself is never in the source — but a 64-character hex string is
+# indistinguishable from a leaked key to a scanner. The rule below allows that one path, not the
+# detector, so a genuine key committed anywhere else still alerts.
+advanced:
+  occurrence_policy: ignore_and_continue
+
+policy_ignore_list:
+  - server/src/config/env.ts
