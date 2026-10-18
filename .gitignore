@@ -25,3 +25,7 @@ tmp/
 # Editor / tool state that is not part of the application.
 .vscode/
 .idea/
+
+# npm is the package manager this project installs with (package-lock.json is tracked). A zero-byte
+# bun.lock left beside it is a stray from some other tool's run, not a second lockfile to maintain.
+bun.lock

@@ -1,6 +1,9 @@
 // Attempts a parcel write and prints only the HTTP status. Run inside the api container via
 // `node -` on stdin so the JSON body never has to survive shell quoting.
 const token = process.env.PROBE_TOKEN;
+// The identity is embedded per run: nothing here is deleted, so a fixed khasra/village would collide
+// with an earlier probe and report a working database as broken.
+const tag = (process.env.PROBE_RUN || Date.now().toString().slice(-6)).replace(/[^0-9A-Za-z]/g, '');
 
 fetch('http://127.0.0.1:3001/api/parcels', {
   method: 'POST',
@@ -9,11 +12,11 @@ fetch('http://127.0.0.1:3001/api/parcels', {
   signal: AbortSignal.timeout(25000),
   headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
   body: JSON.stringify({
-    khasraNo: '9/9',
+    khasraNo: `${tag}/9`,
     khataNo: '99',
     district: 'Jaipur',
     tehsil: 'Sanganer',
-    village: 'ProbeVillage',
+    village: `ProbeVillage${tag}`,
     ownerName: 'Probe Owner',
     mappedAreaHectares: 1.0,
     boundary: [

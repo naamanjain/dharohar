@@ -113,7 +113,11 @@ boundary.
 ## 4. Transport, network and headers
 
 * PostgreSQL publishes **no host port**; the API publishes none either. Only the web container (and
-  Caddy, if you use `docker-compose.tls.yml`) is reachable.
+  Caddy, if you use `docker-compose.tls.yml`) is reachable, and since 2026-10-19 the web binding
+  defaults to `127.0.0.1` — `WEB_BIND=0.0.0.0` is what an operator sets when TLS is in place and the
+  service is meant to be reached from outside. Before that change, `docker compose up` on a host with
+  a routable interface published the SPA and its `/api` proxy over plain HTTP to that network as an
+  unintended side effect of starting the stack.
 * TLS: terminate at Caddy (`docs/DEPLOYMENT.md` §6). Without it the bearer token and the password
   cross the network in clear text.
 * nginx sets CSP, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`,
@@ -152,7 +156,10 @@ defect — but it is a real dependency for a government network.
   without it; demo personas are disabled at module load in production.
 * Production never falls back to in-memory storage: an unreachable database at boot aborts startup,
   and a database that goes away mid-request yields `503` with `PARCEL_WRITE_FAILED` /
-  `DOCUMENT_WRITE_FAILED` — never a `200` that is not durable.
+  `DOCUMENT_WRITE_FAILED` — never a `200` that is not durable. `503` is reserved for that case: a
+  write refused by a data rule answers `400` (unregistered district) or `409`
+  (`PARCEL_IDENTITY_TAKEN`, khasra+village+tehsil already used in that district), because a client
+  that is told "unavailable" will retry the same doomed request forever.
 * OCR cannot invent: the parser reports `—` / `Not recorded` / `Under Review` where the text does not
   say something, and a clause-level negation test (`NO`, `NOT`, `NIL`, `N/A`, `नहीं`, `शून्य`) stops
   "No active court stay order" from being read as an injunction. OCR confidence and line counts come
@@ -229,3 +236,89 @@ defect — but it is a real dependency for a government network.
 15. **A document with neither a district nor a parcel is unreachable rather than repaired.** The write
     path now files every document under a district, so no new row can be created that way; a restore
     containing one would be reported by the checker and needs an explicit, authorized decision.
+16. **The gate and the suites create officers and parcels they cannot delete.** They must run against
+    a real stack to test real authorization, so each run adds accounts in a fabricated domain
+    (`@dharohar.test`) — 39 of them had accumulated on the deployed database by 2026-10-19, 16 with
+    read access to Jaipur or Udaipur records and 8 holding `PARCEL_REHOME`. Nothing deletes rows by
+    design, and `users` has no retirement state (gap 12), so retirement is done by
+    `npm run db:retire-residue` (dry run by default; `RESIDUE_APPLY=true` to act): it revokes every
+    jurisdiction and capability and replaces the password with a random value that is never printed,
+    through the same audited service the admin API uses. `scripts/validate-stack.sh` now runs it as
+    its last step, so the gate retires what the gate creates. Rows survive — as does the reachability
+    problem they were a symptom of: the fixture *documents* with neither a district nor a parcel are
+    still there, and removing those needs the same authorized decision as gap 15.
+
+---
+
+## 8. Incident record — a working credential was published in git history
+
+**What shipped.** The prototype's twelve-character demo password was a literal in `server/src/db/db.ts`, `seed.ts` and eleven suites,
+so the repository carried a password that authenticated four officer accounts in any database seeded
+the documented way. It is **not reproduced here on purpose**: any database seeded before 2026-10-19
+still accepts that string, including deployments this repository does not control, so spelling it in a
+public document keeps the credential alive and re-raises the same scanner incident. Retrieve it from
+`git show archive/exposed-history:server/src/db/db.ts` if it is genuinely needed to identify an old
+database. Commit `a9e5fcc` and two of my own later commits (`fa515b1`, `d3c4006`) repeated
+it; GitGuardian reported it as two *Generic Password* incidents on 2026-10-18. The exposure was
+introduced by the agent's commits, not by the original prototype, which is worth stating because the
+usual assumption — "the new code is the safe code" — was the wrong one here.
+
+**Also flagged, not a credential.** The two *Generic High Entropy Secret* incidents (`014b2bf`,
+`6cd3a40`) are five SHA-256 digests recorded in `public/tesseract/PROVENANCE.md` and
+`sha256sum.txt` — integrity checksums for vendored OCR binaries that are fetched from upstream and
+verified against them. They are public artefacts' digests, not secrets, and cannot unlock anything.
+
+**What was done, with the measurement rather than the intention.**
+
+| Change | Evidence |
+| --- | --- |
+| The literal no longer exists in the source. | Fixed-string `grep -rl` for the retired password over the working tree, excluding `node_modules` and `.git`: **0 files**. |
+| No commit reachable from `origin/main` contains it. | Per-commit `git grep` over `git rev-list origin/main` (6 commits): clean.    History was replaced with six phase commits and force-pushed with `--force-with-lease`; the previous
+   8-commit line is reachable from no pushed ref (kept locally as `archive/exposed-history` only). |
+| The running artifact was stale and still carried it. | `grep -rl` inside `dharohar-prod-api-1` found 4 bundled files. The stack had been built from a directory that no longer existed. Rebuilt from the repository: **0 files**. |
+| The published credential stopped working **in the deployed database**. | Login for `operator`, `tehsildar`, `patwari`, `auditor` @`dharohar.local`: old literal **401**, rotated password **200** — measured before and after the rebuild, and again after the validation gate re-seeded. |
+| The signing secret was rotated. | New `JWT_SECRET` in the untracked `.env`; every token minted before 2026-10-19 is rejected. Anyone already signed in had to sign in again. |
+| The gate went from 33/34 to **37 passed, 0 failed**. | `scripts/validate-stack.sh`, run against the rebuilt stack: the db-outage sequence (503 while down, `AUTHORIZATION_UNAVAILABLE` on writes, 200 on recovery, a real write proven after recovery), both authorization suites over HTTP, and the retirement of the accounts those suites create. The 34th check had been failing because no `ADMIN_PASSWORD` was available; the credential kept in `.env.local-credentials-preserve-me` turned out to be the live `sysadmin@dharohar.local` officer holding `USER_ADMIN` (HTTP 200), which is what that check needs. Three more checks were added on 2026-10-19 — see the next section. |
+| The deployment is private again. | `netstat` shows `127.0.0.1:8088` only (was `0.0.0.0:8088`); compose default for `WEB_BIND` changed to loopback so a fresh `up` cannot repeat it. |
+| A verified backup exists before all of the above. | `backups/dharohar_dharohar_20261018_191018.dump` (13 relations), `sha256sum -c` → **OK**; after the recreate, 10 parcels / 19 documents / 274 audit entries / 10 valid geometries / 3 applied migrations were counted again. |
+
+### Four defects the rebuilt gate produced
+
+Re-running the gate against the rebuilt stack was not a formality: each of these was found because a
+check failed, and two of them were failures of the *checking*, not of the product.
+
+1. **The gate proved recovery with a health endpoint.** `ready → 200` needs one working connection; a
+   write needs one from the pool. After the outage test the suite's first write answered
+   `503 PARCEL_WRITE_FAILED` while the gate had already reported the database recovered. There is now a
+   post-recovery write probe (up to 6 attempts, reporting which attempt succeeded), and it uses the
+   **same** parcel identity the outage step was refused, so the pair proves the write path came back
+   rather than that some other payload happened to be free.
+2. **That 503 was not the pool.** `docker logs` said `duplicate key value violates unique constraint
+   "uq_parcels_identity"`: the suite's re-home fixture used `run.slice(-2)` — 100 possible khasra
+   numbers — so a run collided with an earlier run's leftover, which nothing can delete. The comment
+   that the first explanation was wrong is recorded in the suite: a plausible mechanism plus one
+   supporting log line (`Idle pool client error`) is not a diagnosis.
+3. **A constraint violation was reported as an outage.** Any `23505` on that constraint answered
+   `503 PARCEL_WRITE_FAILED`, which instructs the client to retry forever. It answers `409
+   PARCEL_IDENTITY_TAKEN` now, and the assertion was proven to be load-bearing: disabling the mapping
+   turns the suite to `89 PASSED, 2 FAILED`, restoring it returns `91 PASSED, 0 FAILED`.
+4. **The retirement tool reported "nothing to retire" while 24 matching accounts existed**, because
+   its default suffix was `.dharohar.test` and the addresses end in `@dharohar.test`. The dry run is
+   what caught it. A pattern that matches nothing in the whole table now exits non-zero, so a typo in a
+   filter cannot read as a clean result — the same class of hole as the two gates that once compared
+   Docker error strings against each other and passed.
+
+**Still the operator's to close — none of it is a code change:**
+
+1. In GitGuardian, mark the two *Generic High Entropy Secret* incidents **not a secret** (they are
+   checksums) and the two *Generic Password* incidents **resolved / regenerated**. Rewriting history
+   does not retract a scan: the alerted commits remain in GitHub's own records and in GitGuardian's.
+2. The repository is **public** (GitHub answers `200` for the anonymous API read). A public repository
+   whose history was just rewritten is still public; making it private is one setting, and it is the
+   only change that stops further history from being readable.
+3. `DEMO_PASSWORD` and the `sysadmin` password now live only in the untracked `.env` and
+   `.env.local-credentials-preserve-me`. Anything that can read this working tree can read them, which
+   is exactly why the personas must never be seeded anywhere reachable by real records.
+4. Anyone who learned the old literal must not be able to reach the deployment. It no longer
+   authenticates — that was the point of the rotation — but any *documented* copy of it (README
+   history, screenshots, pitch notes, chat logs) should be retired rather than trusted.

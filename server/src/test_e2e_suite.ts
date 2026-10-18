@@ -299,7 +299,18 @@ async function runE2ESuite() {
     });
     const auditData = await auditRes.json();
     recordTest('STEP-08', 'Audit Log Retrieval (HTTP 200)', auditRes.status === 200 && auditData.success === true);
-    recordTest('STEP-08', 'Audit Trail Populated (> 5 entries)', auditData.data?.total >= 5, `Total: ${auditData.data?.total}`);
+
+    // Asserted by content, not by a count. `total >= 5` here passed only on a database carrying the
+    // history of earlier runs: against a freshly migrated and seeded one, the tehsildar's district had
+    // two entries and the check failed. What this run guarantees is that the seal it applied — on
+    // `sealTargetId`, which it created for exactly that reason — is recorded against that record.
+    const sealTrailRes = await fetch(`${BASE_URL}/parcels/${sealTargetId}/audit`, {
+      headers: { Authorization: `Bearer ${tehsildarToken}` },
+    });
+    const sealTrail = await sealTrailRes.json();
+    const sealActions: string[] = (sealTrail.data?.auditLogs || []).map((e: any) => e.actionType || e.action_type);
+    recordTest('STEP-08', 'The seal applied in this run is in the sealed record\'s trail', sealActions.includes('RECORD_SEALED'), `actions: ${sealActions.join(', ') || 'none'}`);
+    recordTest('STEP-08', 'A record this run changed has a non-empty trail', sealTrail.data?.total >= 1, `Total: ${sealTrail.data?.total}`);
 
     const chainVerify = await verifyAuditChain();
     recordTest('STEP-08', 'SHA-256 Hash Chain Integrity 100% Intact', chainVerify.isValid === true, chainVerify.message);

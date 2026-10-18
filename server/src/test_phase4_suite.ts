@@ -353,7 +353,20 @@ async function runPhase4Tests() {
     });
     const parcelAuditData = await parcelAuditRes.json();
     assert(parcelAuditRes.status === 200, `Home-district parcel audit trail readable (HTTP ${parcelAuditRes.status})`);
-    assert(parcelAuditData.data?.total >= 2, `Parcel DH-JPR-RAM-001024 has ${parcelAuditData.data?.total} chronological audit events`);
+    // Asserted by content rather than by a count. `total >= 2` was only ever satisfied on a database
+    // that had been run against before: DH-JPR-RAM-001024 arrives from the seed already sealed, and a
+    // seeded state has no chain entry behind it, so one clean run leaves exactly the validation event.
+    const homeActions: string[] = (parcelAuditData.data?.auditLogs || []).map((e: any) => e.actionType || e.action_type);
+    assert(homeActions.includes('VALIDATION_EXECUTED'), 'The validation this run performed is recorded on the parcel it validated', `actions: ${homeActions.join(', ') || 'none'}`);
+
+    // And the seal this run actually applied — on the record it created for the purpose, because the
+    // demo parcel is already sealed and a second seal is correctly refused — must be in its trail.
+    const sealedTrailRes = await fetch(`${BASE_URL}/parcels/${sealTargetId}/audit`, {
+      headers: { Authorization: `Bearer ${tehsildarToken}` },
+    });
+    const sealedTrail = await sealedTrailRes.json();
+    const sealedActions: string[] = (sealedTrail.data?.auditLogs || []).map((e: any) => e.actionType || e.action_type);
+    assert(sealedActions.includes('RECORD_SEALED'), 'The seal this run applied is recorded on the record it sealed', `actions: ${sealedActions.join(', ') || 'none'}`);
 
     // Another district's audit trail is not readable at all.
     const foreignAuditRes = await fetch(`${BASE_URL}/parcels/DH-UDA-KOT-001117/audit`, {

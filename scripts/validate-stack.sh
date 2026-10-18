@@ -30,6 +30,10 @@ if [ -z "$POSTGRES_PASSWORD" ]; then
 fi
 
 PASS=0; FAIL=0
+# One identity for both write probes in this run: the request the outage must refuse (T7) is then the
+# same request that must succeed after recovery, so the pair proves the write path came back rather
+# than that a different payload happened to be free.
+PROBE_RUN="V$(date +%s | tail -c 6)"
 
 # A measurement that looks like a tool error is not a measurement. Counting one as a
 # pass — or comparing one against another — is how a broken gate reports success.
@@ -128,7 +132,7 @@ chk "api process still running with db down" "running" "$(docker inspect dharoha
 # move: authorizations are re-read from the database per request, so a refusal can now come from the
 # authentication layer (AUTHORIZATION_UNAVAILABLE) before the write layer (PARCEL_WRITE_FAILED) is
 # reached. Both are 503 and neither claims the record was saved.
-WRITE_LINE=$(docker compose -f docker-compose.prod.yml exec -T -e PROBE_TOKEN="$TEH" api node - < scripts/probe-write.mjs 2>&1 | tail -1)
+WRITE_LINE=$(docker compose -f docker-compose.prod.yml exec -T -e PROBE_TOKEN="$TEH" -e PROBE_RUN="$PROBE_RUN" api node - < scripts/probe-write.mjs 2>&1 | tail -1)
 chk "write attempt -> 503, not a success" "503" "$(echo "$WRITE_LINE" | cut -d'|' -f1)"
 case "|$(echo "$WRITE_LINE" | cut -d'|' -f2)|" in
   "|PARCEL_WRITE_FAILED|"|"|AUTHORIZATION_UNAVAILABLE|")
@@ -139,6 +143,27 @@ esac
 docker compose -f docker-compose.prod.yml start db >/dev/null 2>&1
 sleep 20
 chk "ready recovers to 200" "200" "$(probe "http://127.0.0.1:3001/api/health/ready" "")"
+
+# A health endpoint proving one connection works is not proof that writes work. On 2026-10-19 this
+# gate reported "ready recovers to 200" and then the authorization suite's first write failed with
+# 503 PARCEL_WRITE_FAILED: the restart had terminated a pooled client, and the request that happened
+# to draw it was sacrificed. That is honest behaviour — nothing was claimed that did not commit — but
+# a deployment that cannot write after its database came back is not recovered. Retry the probe and
+# report how long recovery actually took. A 409 also proves the write path reached the database.
+RECOV=""
+RECOV_ATTEMPT=0
+for attempt in 1 2 3 4 5 6; do
+  RECOV_ATTEMPT=$attempt
+  RECOV=$(docker compose -f docker-compose.prod.yml exec -T -e PROBE_TOKEN="$TEH" -e PROBE_RUN="$PROBE_RUN" api node - < scripts/probe-write.mjs 2>&1 | tail -1)
+  case "$RECOV" in 2[0-9][0-9]\|*|409\|*) break ;; esac
+  sleep 5
+done
+case "$RECOV" in
+  2[0-9][0-9]\|*|409\|*)
+    echo "  PASS  pool serves a real write after recovery (attempt $RECOV_ATTEMPT: $RECOV)"; PASS=$((PASS+1)) ;;
+  *)
+    echo "  FAIL  the database is back but writes still fail after $RECOV_ATTEMPT attempts: $RECOV"; FAIL=$((FAIL+1)) ;;
+esac
 
 echo "=== T10 web proxy serves SPA + /api ==="
 chk "GET / -> 200" "200" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8088/)"
@@ -158,6 +183,24 @@ if [ -n "${ADMIN_PASSWORD:-}" ]; then
   chk "test:provisioning passes" "0" "$?"
 else
   echo "  FAIL  ADMIN_PASSWORD not exported — provisioning suite not run (bootstrap: npm run db:bootstrap-admin)"; FAIL=$((FAIL+1))
+fi
+
+echo "=== T13 the gate retires the officers it created ==="
+# T12 proves authorization by creating real officers in a fabricated domain, against this database.
+# Nothing deletes them — there is no hard delete in this application by design — so before this step
+# every validation run left a few more accounts that could authenticate, and 16 of the 24 accumulated
+# by 2026-10-19 could read Jaipur or Udaipur records. Retirement is soft (revocation + a password
+# replaced by a random value that is never printed) and is written into the audit chain by the same
+# service the admin API uses. It runs inside the api container because the database publishes no port.
+docker compose -f docker-compose.prod.yml exec -T \
+  -e RESIDUE_APPLY=true \
+  -e RESIDUE_ADMIN_EMAIL="${ADMIN_EMAIL:-sysadmin@dharohar.local}" \
+  api node dist-server/retireSuiteResidue.js > /tmp/validate-retire.log 2>&1
+chk "suite residue retired (exit 0, none left reachable)" "0" "$?"
+if grep -qE 'account\(s\) revoked and locked|holds USER_ADMIN' /tmp/validate-retire.log; then
+  echo "  PASS  retirement reported its outcome ($(grep -oE '[0-9]+ account\(s\) revoked' /tmp/validate-retire.log | head -1))"; PASS=$((PASS+1))
+else
+  echo "  FAIL  retirement exited 0 without saying what it did — read /tmp/validate-retire.log"; FAIL=$((FAIL+1))
 fi
 
 echo

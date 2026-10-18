@@ -9,7 +9,9 @@
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 
-dotenv.config();
+// `quiet` because dotenv otherwise prints a status line — including a rotating marketing tip with a
+// third-party URL — to stdout on every process start. Server logs must carry server output.
+dotenv.config({ quiet: true });
 
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 

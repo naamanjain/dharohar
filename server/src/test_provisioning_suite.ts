@@ -71,6 +71,11 @@ const codeOf = (res: Res) => String(res.body?.error?.code ?? '');
 const parcelDistrict = (res: Res) => String(res.body?.data?.parcel?.district ?? '');
 
 async function main() {
+  // Every khasra in this suite embeds the full six digits. Parcel identity is
+  // (khasra_no, village, district, tehsil), a re-homed fixture keeps its identity in the destination
+  // district, and nothing is ever deleted — so a truncated tag (two digits, 100 values) makes one run
+  // collide with an earlier run's leftover and the suite fails on its own history. That is what a
+  // 503 PARCEL_WRITE_FAILED / duplicate uq_parcels_identity meant on 2026-10-19.
   const run = Date.now().toString().slice(-6);
   console.log('\n============================================================');
   console.log('  DHAROHAR PROVISIONING / ASSIGNMENT / RE-HOMING — run ' + run);
@@ -321,7 +326,7 @@ async function main() {
     method: 'POST',
     body: {
       id: testParcelId,
-      khasraNo: `9${run.slice(-2)}/1`,
+      khasraNo: `9${run}/1`,
       khataNo: '77',
       khewatNo: '12',
       patwarCircle: 'Sanganer South',
@@ -338,6 +343,30 @@ async function main() {
     },
   });
   assert(madeParcel.status === 201, 'Fixture parcel created in Jaipur', `got ${madeParcel.status} ${JSON.stringify(madeParcel.body?.error || {})}`);
+
+  // A taken identity is a conflict, not an outage. This answers 409 PARCEL_IDENTITY_TAKEN: until
+  // 2026-10-19 it answered 503 PARCEL_WRITE_FAILED, which reads as "the database is unavailable, try
+  // again" and is what made a fixture collision look like a recovery failure for three hours.
+  const identityClash = await call('/parcels', {
+    token: moverToken,
+    method: 'POST',
+    body: {
+      id: `${testParcelId}-D`,
+      khasraNo: `9${run}/1`,
+      khataNo: '77', khewatNo: '12', patwarCircle: 'Sanganer South',
+      district: 'Jaipur', tehsil: 'Sanganer', village: 'Rampur',
+      mappedAreaHectares: 1.0, recordedAreaHectares: 1.0,
+      ownerName: `Duplicate Identity ${run}`,
+      boundary: [
+        { lat: 26.95, lng: 75.85 }, { lat: 26.95, lng: 75.86 },
+        { lat: 26.94, lng: 75.86 }, { lat: 26.94, lng: 75.85 },
+      ],
+    },
+  });
+  assert(identityClash.status === 409, 'Duplicate parcel identity answers 409, never 503', `got ${identityClash.status} ${JSON.stringify(identityClash.body?.error || {})}`);
+  assert(codeOf(identityClash) === 'PARCEL_IDENTITY_TAKEN', 'The refusal names the taken identity, not the database', codeOf(identityClash));
+  const clashAbsent = await call(`/parcels/${testParcelId}-D`, { token: moverToken });
+  assert(clashAbsent.status === 404, 'The refused duplicate really was not written', `got ${clashAbsent.status}`);
 
   const noCap = await call(`/parcels/${testParcelId}/jurisdiction`, {
     token: moverToken,
@@ -599,7 +628,7 @@ async function main() {
     method: 'POST',
     body: {
       id: probeParcelId,
-      khasraNo: `8${run.slice(-2)}/1`, khataNo: '77', khewatNo: '12', patwarCircle: 'Probe Circle',
+      khasraNo: `8${run}/1`, khataNo: '77', khewatNo: '12', patwarCircle: 'Probe Circle',
       district: probeCode, tehsil: 'Probe Tehsil', village: 'Probe Village',
       mappedAreaHectares: 1.0, recordedAreaHectares: 1.0, ownerName: `Registry probe ${run}`,
       boundary: [
@@ -638,7 +667,7 @@ async function main() {
     token: probeOfficer,
     method: 'POST',
     body: {
-      khasraNo: `8${run.slice(-2)}/2`, khataNo: '77', khewatNo: '12', patwarCircle: 'Probe Circle',
+      khasraNo: `8${run}/2`, khataNo: '77', khewatNo: '12', patwarCircle: 'Probe Circle',
       district: probeCode, tehsil: 'Probe Tehsil', village: 'Probe Village',
       mappedAreaHectares: 1.0, recordedAreaHectares: 1.0, ownerName: `Retired probe ${run}`,
       boundary: [

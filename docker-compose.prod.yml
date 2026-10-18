@@ -102,11 +102,11 @@ services:
         VITE_API_BASE: ${VITE_API_BASE:-/api}
     restart: unless-stopped
     ports:
-      # Host port overridable; pick one that is free (check `netstat -ano | grep LISTEN`).
-      # When running with docker-compose.tls.yml set WEB_BIND=127.0.0.1 so plain HTTP is
-      # reachable only from this machine — Caddy then publishes 80/443 and reaches nginx over the
-      # internal network. Without that, port 8088 is open to the internet with no TLS.
-      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8088}:80"
+      # Default is loopback: `docker compose up` on a machine with a routable interface must not
+      # publish an unauthenticated-HTTPS SPA+API to the network as a side effect of starting it.
+      # Set WEB_BIND=0.0.0.0 (or the host address you want) deliberately, once TLS is in place —
+      # Caddy reaches the web container over the internal network, so it does not need this changed.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8088}:80"
     depends_on:
       api:
         condition: service_healthy

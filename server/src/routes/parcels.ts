@@ -206,6 +206,20 @@ function respondWriteError(res: Response, err: any, what: string, parcelId = '')
     });
   }
 
+  // Two parcels cannot share (khasra, village, tehsil) inside one district, and that includes moving a
+  // parcel into a district where the identity is already taken. The database refuses it with 23505;
+  // reporting that as 503 PARCEL_WRITE_FAILED tells the caller the dependency is unavailable and to
+  // retry the same request forever. It is a conflict, and it is named as one.
+  if (err?.code === '23505' && /uq_parcels_identity/.test(String(err?.constraint ?? ''))) {
+    return res.status(409).json({
+      success: false,
+      error: {
+        code: 'PARCEL_IDENTITY_TAKEN',
+        message: 'Another parcel already carries this khasra number, village and tehsil in that district. No change was committed.',
+      },
+    });
+  }
+
   const refusal = districtRefusal(err);
   if (refusal) {
     return res.status(400).json({ success: false, error: refusal });

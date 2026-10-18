@@ -99,9 +99,14 @@ POSTGRES_USER=dharohar
 POSTGRES_DB=dharohar
 POSTGRES_PASSWORD=<first value>
 JWT_SECRET=<second value>
+# The four demo personas' password. There is no shared demo password in this repository: the seed
+# reads this value, refuses to run against a production database without SEED_CONFIRM=demo, and
+# prints it once. The suites and scripts/validate-stack.sh take it from the environment too.
+DEMO_PASSWORD=<openssl rand -hex 12, or any private value>
 # Optional: keep seals verifiable after a JWT secret rotation.
 # SEAL_SIGNING_KEY=<another openssl rand -hex 32>
 # JWT_EXPIRY_HOURS=8
+# WEB_BIND=0.0.0.0   # only once TLS is in place; the default is 127.0.0.1
 ```
 
 Compose **fails closed** on these: `${POSTGRES_PASSWORD:?...}` and `${JWT_SECRET:?...}` abort the
@@ -111,6 +116,31 @@ must run from the directory containing `.env` (or with the variables exported).
 Rules this project observes: no secret is printed by the app, the scripts or this runbook; the
 `README.md` no longer publishes a signing secret; `server/src/config/env.ts` rejects the old leaked
 value outright; logs from `scripts/backup.sh` / `restore.sh` mask connection details.
+
+### Rotating a credential that was published
+
+Rewriting git history does not un-teach a password. When a credential that authenticates something
+has been committed, the order below is the one that worked on 2026-10-19; each step names what proves
+it, because "we rotated it" and "the deployed service still accepts it" looked identical until the
+second one was measured.
+
+1. `./scripts/backup.sh --container <db> --dbname <db>` and `sha256sum -c` the sidecar **from inside
+   the `backups/` directory** — from the repository root the recorded filename does not resolve and
+   the check fails for a reason that has nothing to do with the data.
+2. Remove the literal from the source, then prove it: `grep -rl '<literal>' --exclude-dir=node_modules
+   --exclude-dir=.git .` must print nothing.
+3. Rebuild and recreate the stack. Prove the *running artifact* is the fixed one:
+   `docker exec <api> grep -rl '<literal>' /app/dist-server` must print nothing. A container built
+   from a directory you have since deleted will keep serving the old code indefinitely.
+4. Rotate the credential in the database — re-seed the demo personas with a new `DEMO_PASSWORD`, or
+   change the real account through the provisioning path. Then measure both directions against the
+   live service: old value → `401`, new value → `200`, **for accounts you have confirmed exist**.
+   Testing a username that is not in `users` also returns `401`, which is how this step reported
+   success on a deployment that was still exposed.
+5. Rotate `JWT_SECRET`, and expect every issued token to die with it.
+6. Replace the published history (`--force-with-lease`), then re-scan:
+   `for c in $(git rev-list origin/main); do git grep -I '<literal>' "$c"; done` must find nothing.
+7. Disposition the scanner alerts manually — see `docs/SECURITY.md` §8.
 
 ---
 
@@ -213,6 +243,17 @@ docker compose -f docker-compose.prod.yml exec -it \
 # 4. Read the jurisdiction report before and after any migration that touches districts
 #    (0003 is one). It never repairs a row: it names the rows that need a departmental decision.
 npm run test:integrity          # exit 0 = consistent; exit 1 = findings, listed by primary key
+#    Against the containerised stack the database publishes no host port, so run the same check
+#    inside the api container instead — the script is bundled into the image for exactly this:
+docker compose -f docker-compose.prod.yml exec -T api node dist-server/verify_district_integrity.js
+
+# 5. Retire the officer accounts the test gate created (it runs suites against this stack, so it
+#    creates real logins in a fabricated domain, and nothing deletes rows by design).
+#    Dry run first — it lists every candidate with what they can currently reach:
+docker compose -f docker-compose.prod.yml exec -T api node dist-server/retireSuiteResidue.js
+#    Then act: revoke jurisdictions + capabilities and invalidate the password, each change audited.
+docker compose -f docker-compose.prod.yml exec -T -e RESIDUE_APPLY=true \
+  -e RESIDUE_ADMIN_EMAIL=sysadmin@dharohar.local api node dist-server/retireSuiteResidue.js
 ```
 
 **Before upgrading a database that already holds records, take a backup and read the report.**
@@ -221,7 +262,9 @@ Migration 0003 is additive and refuses to guess — but it can refuse loudly: an
 aborts the whole file, rolls back, and leaves the database exactly as it was. That is the designed
 behaviour, not a failure of it. The runner prints PostgreSQL's `detail` and `hint`, and the hint names
 `npm run test:integrity` as the way to see the offending rows. Resolve them with the department's
-answer, then re-run. `docs/DISTRICT-INTEGRITY-REPORT.md` §3 lists what 0003 will not do on its own.`server/src/db/migrations/*.sql` in filename order, records each in `schema_migrations` with a
+answer, then re-run. `docs/DISTRICT-INTEGRITY-REPORT.md` §3 lists what 0003 will not do on its own.
+
+Migrations are applied from `server/src/db/migrations/*.sql` in filename order, recorded each in `schema_migrations` with a
 SHA-256 checksum, refuses to run if an already-applied file changed, runs each file in its own
 transaction (failure = no partial application, nothing recorded), and refuses statements that cannot
 be transacted. It never drops, truncates or reseeds. Re-running it is a no-op.
@@ -384,9 +427,11 @@ authorization (anonymous read → 401, wrong role seal → 403, patching `verifi
 **cross-district read and PATCH → 404 with the foreign row provably unchanged**); document
 jurisdiction filing (district-less upload is filed under the uploader, readable by them, 404 to
 another district); **database outage** (`/api/health/ready` → 503, the API process still `running`, a
-write attempt → 503 `PARCEL_WRITE_FAILED`, then recovery to 200); the nginx proxy (SPA root, SPA deep
-route, `/api/health` proxied); that **the database publishes no host port**; and finally the two
-authorization suites against this stack.
+write attempt → 503 `PARCEL_WRITE_FAILED`, recovery to 200, **and then the same write proven to
+succeed** — a health endpoint proves one connection, not that the pool can serve a write); the nginx
+proxy (SPA root, SPA deep route, `/api/health` proxied); that **the database publishes no host port**;
+the two authorization suites against this stack; and finally the retirement of the officer accounts
+those suites created, with its outcome required to be stated rather than implied.
 
 The sweep refuses to report a pass it did not measure: it aborts with exit 2 if the Docker daemon is
 unreachable or the database credentials cannot be read, and any check whose "actual" value is an error
