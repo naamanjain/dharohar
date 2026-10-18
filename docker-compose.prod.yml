@@ -1,0 +1,133 @@
+# DHAROHAR — production stack for a small free-tier VM (1 vCPU / 2GB RAM class).
+#
+# Usage:
+#   1. Copy .env.example values into your shell or an UNTRACKED .env next to this file.
+#   2. Set the three required variables below (compose refuses to start without them).
+#   3. docker compose -f docker-compose.prod.yml up -d --build
+#
+# NO credentials are hardcoded anywhere; nothing here should ever be committed with
+# real secret values.
+name: dharohar-prod
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REQUIRED OPERATOR INPUT — placeholder mechanism, intentionally fails closed:
+#   POSTGRES_PASSWORD  : set it yourself, e.g. `openssl rand -hex 24`. There is NO
+#                        default value; compose aborts with the message below if it
+#                        is missing. Same for JWT_SECRET.
+# ──────────────────────────────────────────────────────────────────────────────
+
+x-db-credentials: &db-credentials
+  POSTGRES_USER: ${POSTGRES_USER:-dharohar}
+  POSTGRES_DB: ${POSTGRES_DB:-dharohar}
+  # The :? operator makes an unset/empty value a hard error — no silent default password.
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - generate one with 'openssl rand -hex 24' and export it or put it in an untracked .env file}
+
+services:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    restart: unless-stopped
+    environment:
+      <<: *db-credentials
+    # NO `ports:` — PostgreSQL is reachable only on the internal compose network.
+    volumes:
+      - dharohar_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dharohar} -d ${POSTGRES_DB:-dharohar}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # Required: the API refuses to boot in production without a JWT_SECRET,
+      # and rejects the leaked prototype secret / ALLOWED_ORIGINS="*" outright.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set - generate one with 'openssl rand -hex 32'}
+      SEAL_SIGNING_KEY: ${SEAL_SIGNING_KEY:-}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-24}
+      # Comma-separated public origins, e.g. https://dharohar.example.gov.in.
+      # Empty is safe when the SPA is served same-origin through nginx (see web).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # nginx sets X-Forwarded-* — the Express app consumes them via trust proxy.
+      TRUST_PROXY: "true"
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-dharohar}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}
+      PGDATABASE: ${POSTGRES_DB:-dharohar}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dharohar}:${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}@db:5432/${POSTGRES_DB:-dharohar}
+      # Apply pending versioned migrations from dist-server/db/migrations on boot (entrypoint flag).
+      # Forward-only and additive; it never seeds or resets. Seeding is a separate, explicit step.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+    healthcheck:
+      # /api/health/ready actively pings the DB and returns 503 when unreachable.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Uploads/artefact scratch space. The current API stores document bytes in the
+      # database, but this named volume guarantees any on-disk artefacts survive
+      # container recreation; it is the mount point future file storage should use.
+      - dharohar_uploads:/app/uploads
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      # Set to an absolute backend URL only if the SPA must NOT use the nginx /api proxy.
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
+    restart: unless-stopped
+    ports:
+      # Host port overridable; pick one that is free (check `netstat -ano | grep LISTEN`).
+      # When running with docker-compose.tls.yml set WEB_BIND=127.0.0.1 so plain HTTP is
+      # reachable only from this machine — Caddy then publishes 80/443 and reaches nginx over the
+      # internal network. Without that, port 8088 is open to the internet with no TLS.
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks: [backend]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+volumes:
+  # Named (not bind) so data survives `docker compose down` and container recreation.
+  dharohar_pgdata:
+  dharohar_uploads:
+
+networks:
+  backend:
+    driver: bridge

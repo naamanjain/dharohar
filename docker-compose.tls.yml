@@ -1,0 +1,50 @@
+# DHAROHAR — HTTPS overlay for docker-compose.prod.yml.
+#
+#   WEB_BIND=127.0.0.1 docker compose -f docker-compose.prod.yml -f docker-compose.tls.yml up -d --build
+#
+# What it changes:
+#   * adds Caddy as the only service that publishes 80/443; it terminates TLS with an
+#     automatically issued + renewed Let's Encrypt certificate and proxies to the web container;
+#   * relies on WEB_BIND=127.0.0.1 (see docker-compose.prod.yml) so the plain-HTTP port is not
+#     reachable from outside the host.
+#
+# Requirements before this can issue a certificate:
+#   * DNS for the hostname in deploy/caddy/Caddyfile points at this server's public IP;
+#   * inbound 80 and 443 are open (cloud security list / firewall) — port 80 is required because
+#     ACME HTTP-01 validation uses it.
+#
+# The certificates live in named volumes, so they survive container recreation.
+name: dharohar-prod
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - dharohar_caddy_data:/data
+      - dharohar_caddy_config:/config
+    networks: [backend]
+    healthcheck:
+      # Liveness through Caddy's own admin listener (loopback inside the container), not a config
+      # re-parse on a timer.
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:2019/config/apps/http || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+volumes:
+  dharohar_caddy_data:
+  dharohar_caddy_config:

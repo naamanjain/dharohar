@@ -1,0 +1,31 @@
+{
+    # ACME account contact. Let's Encrypt sends expiry and renewal failures here.
+    email ops@urbantechx.in
+}
+
+# Public hostname for the DHAROHAR officer interface. Caddy obtains and auto-renews the
+# certificate from Let's Encrypt once DNS for this name points at this machine.
+dharohar.urbantechx.in {
+    encode gzip zstd
+
+    # `web` is the nginx container from docker-compose.prod.yml. It already serves the SPA,
+    # the /api reverse proxy, the self-hosted OCR assets and the security headers, so Caddy only
+    # terminates TLS here and must not duplicate the proxy rules. Caddy sets X-Forwarded-For
+    # (appending the real client address) and X-Forwarded-Proto on its own; the Express app reads
+    # them because TRUST_PROXY=true is set in the compose file.
+    reverse_proxy web:80
+
+    # Access log to stdout so `docker compose logs caddy` shows it.
+    log {
+        output stdout
+        format console
+    }
+}
+
+# Optional: a separate api.<host> origin. Only needed if the SPA is served from a DIFFERENT
+# origin than the API. With the default same-origin /api proxy this block is unnecessary, and
+# leaving it out means one less certificate and one less CORS decision.
+#
+# api.dharohar.urbantechx.in {
+#     reverse_proxy api:3001
+# }
