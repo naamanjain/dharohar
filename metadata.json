@@ -1,0 +1,6 @@
+{
+  "name": "DHAROHAR — Land Record Digitization System",
+  "description": "Land record digitization system featuring local processing simulation, document quality assessment, mock extraction results, rule-based validation, human verification queue, and Record of Rights (RoR) certification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
