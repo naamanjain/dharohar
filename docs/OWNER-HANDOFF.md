@@ -227,10 +227,13 @@ and restored copy, and the audit chain verified through the API as valid across 
 
 ## 9. What only you (or the department) can decide
 
-1. **Who owns a district.** `organizations` is empty and every district is unattributed. Until that is
-   answered, two tenants cannot both have a "Jaipur", and row-level security has nothing to enforce.
-   Draft `server/src/db-draft/0004_org_scoped_district_registry.sql` exists, is **not** wired into the
-   runner, and deliberately aborts instead of guessing.
+1. **Who owns a district.** Migration 0004 has been applied and created the structure — a stable
+   district identifier, an explicit `organization_districts` relationship, and one tenant named
+   `Dharohar Demo Organization` — and it refused to guess anything beyond that. The eleven
+   `probe NNNNNN` districts the test suites created are classified `test_fixture` and mapped to **no**
+   organization, while eleven parcels still reference them. Retire them, or say which real district
+   each is; that is a person's decision, not a script's. `districts.state_code` is also NULL
+   everywhere, and the next migration cannot install name+state uniqueness while that is true.
 2. **The real district list.** Everything in the registry today was derived from values the demo data
    already contained. Declare the actual ones (`POST /api/admin/districts`) before treating any clean
    integrity report as authoritative.

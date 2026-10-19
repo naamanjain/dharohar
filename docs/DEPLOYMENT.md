@@ -271,6 +271,21 @@ SHA-256 checksum, refuses to run if an already-applied file changed, runs each f
 transaction (failure = no partial application, nothing recorded), and refuses statements that cannot
 be transacted. It never drops, truncates or reseeds. Re-running it is a no-op.
 
+**Adding a migration file is not enough on a containerised deployment.** The `migrate` one-shot reads
+the migrations directory *baked into the image*, so a newly added file is invisible until the image is
+rebuilt — `docker compose build api` (or `up -d --build`) before `docker compose run --rm migrate`.
+Discovered the hard way on 2026-10-19: `run --rm migrate` reported "No pending migrations. 3 applied"
+while the fourth file sat on the host, and the run also failed outright with no registry access to
+rebuild from. Two ways to check rather than assume:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm migrate   # says what it sees
+docker compose -f docker-compose.prod.yml exec -T api ls dist-server/db/migrations   # what is baked in
+```
+
+The second command lists the files the runner can actually apply. If a filename is missing there, the
+image is stale and no amount of re-running `migrate` will change that.
+
 ### Do not seed a real database
 
 `npm run db:seed` / `node dist-server/db/seed.js` inserts **fabricated demo records**. It is refused

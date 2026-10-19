@@ -204,12 +204,17 @@ defect — but it is a real dependency for a government network.
    (`superuser=false`, `bypassrls=false`, DDL/TRUNCATE/DELETE/audit-UPDATE/ledger-INSERT refused by
    PostgreSQL itself — see `scripts/probe-role.mjs`), and the schema-owner credential is held only by
    the one-shot `migrate`/`roleinit`/`maint` services. What is missing is the policy and the
-   per-transaction GUC, and the thing blocking *that* is a decision: `organizations` is empty and
-   `districts` is a global registry, so a tenant-scoped policy has nothing in the schema to enforce.
-   `docs/DATA-MODEL-JURISDICTION.md` §3.2 states the order of work; draft migration 0004 refuses to
-   guess the tenancy and aborts. Until policies exist, application authorization is the only layer.
-7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every one
-   of the 33 `land_documents` rows has an empty `image_uri` — OCR text and metadata, no source bytes.
+   per-transaction GUC. Migration 0004 (applied 2026-10-19) supplied the tenant structures the policy
+   needs to reference — `organization_districts` as an explicit many-to-many, a stable district
+   identifier, and `district_id` on the four child tables — but two things still make a tenant policy
+   unwriteable: the only organization that exists is the **demo** one, and the application still keys
+   on the old natural key until 0005 removes the global name constraint and repoints the foreign keys.
+   Order of work: `docs/DATA-MODEL-JURISDICTION.md` §3.2 and `docs/DISTRICT-TENANCY-MODEL.md` §4.
+   Until policies exist, application authorization is the only layer.
+7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every
+   `land_documents` row in the deployment has an empty `image_uri` — OCR text and metadata, no source
+   bytes. The one exception is the 1.5 MB payload written deliberately as a backup-drill fixture, and
+   it is synthetic.
    Nothing is broken in the storage path (a 1.5 MB payload written through the API round-tripped
    through backup and restore with an identical digest), but a record set without its source images is
    not digitized land records, and any "documents are preserved" statement about the current data is

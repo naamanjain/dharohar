@@ -1,0 +1,271 @@
+# DHAROHAR — Multi-Organization Tenant & Canonical District Model
+
+Proposal date 2026-10-19. **Status: phases 1–3 are implemented as migration `0004` and applied to the
+demo deployment; §4 phases 4 onward are not.** §7 records the tests that were executed before
+integration and §9 records their results. Nothing here was verified against a public server, and no
+real land record exists anywhere in scope — see §8 for the decisions that remain with a person and
+"what is not claimed" for the boundary of this work.
+
+## 1. The decision this implements
+
+1. DHAROHAR is multi-organization. A deployment is not permanently one department or one district.
+2. A **canonical geographic district registry** exists, keyed by a stable identifier. A district *name*
+   is not the identity and is not globally unique.
+3. Organization↔district is an explicit **many-to-many** relationship. Several organizations may be
+   associated with the same canonical district where governance permits. An organization's own internal
+   units are a separate concept from canonical geography.
+4. Existing demo records are not given invented official ownership. One explicitly named
+   **Dharohar Demo Organization** exists; fixtures map into it only where the mapping is unambiguous;
+   ambiguous rows abort and are reported. History and relationships are preserved.
+5. The demo tenant is never to be read as evidence about real-world jurisdiction ownership.
+
+## 2. What is actually in the database today (measured, deployed instance, 2026-10-19)
+
+| Measured | Value |
+| --- | --- |
+| `organizations` rows | **0** |
+| `districts` rows | **15** — 4 with `provenance='derived'`, 11 with `provenance='declared'` |
+| districts carrying an organization | 0 |
+| `parcels` | 36 rows, all with `district_code`; jaipur 8, udaipur 16, jodhpur 1, and **11 in `probe NNNNNN` districts** |
+| `land_documents` | 36 rows, 34 with `district_code`, **2 NULL** (the two unreachable `persist_probe.pdf` rows) |
+| `users` | 56 rows, all with `district_code` |
+| `user_jurisdictions` active | **5** |
+| Officers with no active jurisdiction and no capability | 51 (retired test-suite fixtures) |
+
+Two things in that table change the design, and both are worth saying plainly:
+
+* **The registry is already polluted with test fixtures.** 11 of the 15 district rows are named
+  `probe 016587`, `probe 381297`, … — created by the provisioning suite calling the declare endpoint,
+  and 11 parcels now *reference* them as their district. A canonical geographic registry containing
+  eleven invented districts is not a registry; before any tenancy work, these rows need a disposition,
+  and promoting them into canonical geography would be exactly the invention decision 4 forbids.
+* **Nothing has an organization.** So every mapping in §5 is a mapping into a *demo* tenant, decided by
+  the fact that this database contains only synthetic data — not by any evidence about real
+  administration. That distinction is the whole of decision 5.
+
+## 3. Proposed schema
+
+Three new shapes, one changed key, and children repointed from the name to the identifier.
+
+### 3.1 `districts` — canonical geography, keyed by an identifier
+
+```
+id            uuid PRIMARY KEY                    -- stable identity; what children reference
+canonical_name text NOT NULL                      -- display form, e.g. 'Jaipur'
+name_key       text NOT NULL                      -- lower(btrim(canonical_name)) for matching
+state_code     text                                -- NULL = not recorded. NEVER inferred
+country_code   text NOT NULL DEFAULT 'IN'
+legacy_code    text UNIQUE                         -- the old districts.code, kept so existing text
+                                                  -- and the old API contract keep resolving
+kind           text NOT NULL CHECK (kind IN ('canonical','test_fixture','retired'))
+is_active      boolean NOT NULL DEFAULT true
+provenance     text NOT NULL                      -- 'derived' | 'declared' | 'imported'
+notes          text
+created_at / retired_at  timestamptz
+UNIQUE (name_key, coalesce(state_code,''))        -- two states may each have a Jaipur
+```
+
+`UNIQUE (canonical_name)` **disappears** (that is decision 2 — today's
+`ux_districts_canonical_name` is the constraint that makes a shared name impossible), and identity moves
+to `id`. `legacy_code` is retained so this is a *repudiation of the name-as-identity assumption*, not a
+rename of every column, and so the HTTP contract can keep returning the district text it returns today.
+
+`state_code` is nullable and stays NULL until a person supplies it. A `NULL` in a unique key means two
+rows with the same name and no state still collide — deliberate: it forces the state question to be
+answered rather than papered over.
+
+### 3.2 `organization_districts` — the authorized relationship, many-to-many
+
+```
+organization_id  text NOT NULL REFERENCES organizations(id)
+district_id      uuid NOT NULL REFERENCES districts(id)
+relationship     text NOT NULL CHECK (relationship IN ('administers','audits','reads'))
+granted_by       text NOT NULL                    -- officer id or 'migration:0004'
+reason           text NOT NULL                    -- required, same rule as re-homing
+granted_at       timestamptz NOT NULL DEFAULT now()
+revoked_at       timestamptz
+PRIMARY KEY (organization_id, district_id, relationship)
+```
+
+* Several organizations may point at one district — decision 3 — with different `reason` and
+  `granted_by` per row, so an audit can say who granted what, when, and why.
+* `revoked_at` rather than DELETE, matching the existing soft-revocation pattern in
+  `user_jurisdictions` and `user_capabilities`. Removing an association is history, not editing.
+* `relationship` distinguishes administering a district from merely reading it, so oversight (auditors)
+  does not silently become mutation rights — the same separation the capability layer already enforces.
+
+### 3.3 `organization_units` — an organization's internal units, separate from geography
+
+```
+id               uuid PRIMARY KEY
+organization_id  text NOT NULL REFERENCES organizations(id)
+parent_unit_id   uuid NULL REFERENCES organization_units(id)
+district_id      uuid NULL REFERENCES districts(id)   -- where the unit sits within canonical geography
+kind             text NOT NULL                      -- 'tehsil','circle','station','office',… org-defined
+name             text NOT NULL
+unit_code        text                               -- organization-internal code, unique only within org
+is_active        boolean NOT NULL DEFAULT true
+UNIQUE (organization_id, unit_code)
+```
+
+This exists because "an organization's own sub-divisions" and "a district of the state" are different
+nouns. Nothing in the current schema expresses the first; the second is `districts`. Uniqueness of a
+unit code is scoped to the organization, never global.
+
+### 3.4 Children reference the identifier, not the name
+
+`parcels`, `land_documents`, `users`, `user_jurisdictions` each gain `district_id uuid NULL REFERENCES
+districts(id)`, backfilled from `district_code` → `districts.legacy_code`. The existing `district_code`
+and the text `district` column stay during the transition so the running API and its 46-check
+jurisdiction suite are not broken by the same commit that changes the key; the CHECK that keeps text
+and code in agreement is extended to keep all three consistent once a row has an id.
+
+`user_jurisdictions` keeps its `district` text primary key for now; a follow-up swaps it to
+`(user_id, district_id)`. Doing both at once would change authorization semantics in one step, which is
+the wrong size of bite.
+
+### 3.5 What the read path means afterwards
+
+An officer's effective districts today are `user_jurisdictions` rows. Under this model they are the
+intersection: districts the officer is assigned **and** the officer's organization has an active
+relationship with, for the relationship kind the operation needs (`administers` for writes, any of the
+three for reads). `STATE_WIDE_READ` continues to widen reads only, never writes. An officer whose org
+has no relationship for a district they are assigned sees nothing — and the API answers 404, not 403,
+for a record outside scope, exactly as now.
+
+## 4. Migration plan (additive, in the order that keeps every step reversible)
+
+| Phase | Work | Runs in |
+| --- | --- | --- |
+| 0 | Verified dump + `sha256sum -c`; restore-drill into a disposable copy and repeat after each phase | operator |
+| 1 | New tables `organization_districts`, `organization_units`; `districts` gains `id`, `kind`, `state_code`, `country_code`, `legacy_code` populated from `code`; **no constraint dropped yet** | 0004 |
+| 2 | Map the demo tenant: insert `ORG-DHAROHAR-DEMO`; write `organization_districts` rows for **canonical** districts only; classify `probe %` rows `kind='test_fixture'` and map nothing | 0004 |
+| 3 | Backfill `district_id` on the four children by exact `legacy_code` match; report every row left NULL rather than guessing | 0004 |
+| 4 | Add the new uniqueness (`UNIQUE (name_key, state_code)`) and drop `ux_districts_canonical_name`; repoint the four FKs from `districts(code)` to `districts(id)` | 0005 |
+| 5 | Application: read scope computed through `organization_districts`; API returns district id + name; jurisdiction tests extended to cross-organization cases | code |
+| 6 | RLS policies — only after 4 and 5 are settled | 0006 |
+
+Phase 4 is split out because dropping a unique constraint and repointing foreign keys is where a
+half-applied schema would be dangerous; phases 1–3 are pure additions and can be re-run safely.
+
+## 5. Existing-record mapping report — what maps, what does not, what aborts
+
+Measured against the deployed database described in §2. "Maps" means *into the demo tenant*, which is
+the only tenant that exists, and which asserts nothing about real administration (decision 5).
+
+| Group | Count | Disposition | Why |
+| --- | --- | --- | --- |
+| Registry rows `ajmer, jaipur, jodhpur, udaipur` (`provenance='derived'`) | 4 | `kind='canonical'`, mapped to `ORG-DHAROHAR-DEMO` with `relationship='administers'`, `granted_by='migration:0004'`, reason naming the demo tenant | They are the only rows resembling real districts, they came from record text, and the records that used them are demo data |
+| Registry rows matching `probe %` | 11 | `kind='test_fixture'`, **not** mapped to any organization | Invented by the test suite. Assigning them to the demo org would launder fixtures into canonical geography — precisely the invention decision 4 forbids |
+| Parcels in the 4 canonical districts | 25 | `district_id` backfilled exactly | Unambiguous single match |
+| Parcels in a `probe` district | 11 | `district_id` backfilled (the row exists), **no organization relationship**, so they are unreachable to every officer until a person decides | The record→district link is a fact; the district's canonical status is not. Backfilling the FK keeps history (decision 4); leaving it un-mapped keeps it honest |
+| Documents with `district_code` | 34 | backfilled as above | same rule |
+| Documents with NULL `district_code` | 2 | stay NULL, reported | These are the two known unreachable rows. Inventing a district for them is forbidden |
+| Officers in canonical districts | 5 of 56 | `user_jurisdictions.district_id` backfilled, org derived from the district relationship | Active assignments only |
+| Retired fixture officers | 51 | `district_id` backfilled where the code resolves, no organization relationship | They hold no active jurisdiction; promoting them would resurrect test identities |
+
+**Abort conditions the migration enforces rather than guesses through:**
+
+1. A `districts.code` resolving to more than one registry row → abort, list the codes.
+2. A child row whose `district_code` is non-NULL but matches no registry row → abort, list the row
+   keys. (Measured today: none — all 36 parcels and 34 coded documents resolve.)
+3. An organization insert conflicting with an existing `ORG-DHAROHAR-DEMO` that has a *different* name
+   → abort; the demo tenant's identity is a fact, not a preference.
+4. The canonical name uniqueness check finding two rows with the same `name_key` and no `state_code` →
+   abort, because choosing which is "the" Jaipur is a governance decision, not a `min(id)`.
+
+## 6. Rollback strategy
+
+* **Before integration, rollback is the dump.** Phases 1–3 are additive: every object created by 0004 is
+  new (`organization_districts`, `organization_units`, `districts.id/kind/state_code/country_code/
+  legacy_code`, `district_id` on four tables). No constraint is dropped and no row is deleted, so
+  dropping those objects restores the previous state exactly. `scripts/rollback-0004.sql` is written
+  alongside and executed in the same test run, so the reverse path is a tested artifact rather than a
+  paragraph of intentions.
+* **The application keeps reading `district_code` throughout phases 1–3**, which is what makes a
+  mid-change rollback safe: a restored dump plus the old code still serves, because nothing the old code
+  reads was removed.
+* **Phase 4 is the point of no return without a restore.** It drops the global name uniqueness and
+  repoints four foreign keys. It ships only with: a verified dump taken immediately before, the
+  validation gate green on the restored copy, and the rollback script re-tested against that dump.
+  If either check is not green, the phase is not applied — the alternative is an unusable schema.
+* **No `--allow-non-empty` restores.** `scripts/restore.sh` refuses a non-empty target by default, and
+  the drill procedure is documented in `docs/DEPLOYMENT.md` §8.
+* The migration runner is forward-only and records a checksum per file; re-running an applied file
+  aborts rather than double-applying. A rollback therefore means either the reverse script (phases 1–3)
+  or a restore from a verified dump (any phase).
+
+## 7. Test plan against a disposable copy (what has to be true before this touches the runner)
+
+1. Restore the current deployment into a throwaway database (`scripts/restore.sh --create-db`).
+2. Run 0004 → expect success, and assert the mapping report's numbers as the *output* of the run.
+3. Re-run 0004 → expect a clean no-op (idempotence), not a duplicate-key failure.
+4. Run the §5 aborts on purpose, one at a time, in the disposable copy: duplicate code, orphan
+   `district_code`, pre-existing differently-named demo org. Each must abort with its named report and
+   leave the schema unchanged — a guard that has never fired is not evidence.
+5. Run `npm run test:registry`, `test:integrity-gate`, `test:jurisdiction`, `test:provisioning` against
+   an API connected to the migrated copy.
+6. Run `scripts/probe-role.mjs` — the new tables must be reachable by `dharohar_app` and not droppable.
+7. Execute `rollback-0004.sql`, confirm the schema equals the pre-migration state, then re-apply.
+8. Only then: move 0004 into `server/src/db/migrations/` and let the gate require it.
+
+## 8. What needs a human governance decision — and what can proceed on synthetic data
+
+**Needs a person (a department, or the owner acting for it). The code cannot decide these:**
+
+1. **The eleven `probe NNNNNN` districts and the eleven parcels under them.** Retire the rows, or delete
+   the parcels (nothing hard-deletes by design), or promote some to real districts. They are test
+   residue; the tenancy migration deliberately refuses to dress them up as geography.
+2. **Which state each canonical district belongs to** (`state_code`). Currently NULL everywhere, and
+   `NULL` in the unique key means a shared name cannot be resolved without someone saying which state.
+3. **Whether more than one organization may administer the same district in the same state**, and under
+   which relationship kind — the schema permits it; only governance says whether it is allowed.
+4. **What the real organizations are** (names, hierarchy, who may grant an association) and the identity
+   and key of the first real tenant, so the demo tenant can be separated from it structurally rather
+   than by convention.
+5. **Disposition of the 2 district-less, parcel-less documents** and the 51 retired test officers.
+6. **Whether the demo tenant may ever coexist with a real tenant in one database**, or whether a real
+   deployment must start from an empty registry. Recommendation: start real deployments empty and keep
+   `ORG-DHAROHAR-DEMO` out of them; the schema should be able to say so, which is a policy, not a column.
+
+**Safe to complete now with synthetic data only:** phases 1–3 of the migration and their tests;
+the rollback script; the `organization_units` table and its API; extending the authorization read path
+to intersect `user_jurisdictions` with `organization_districts`, exercised by new cross-organization
+negative tests; the RLS policy design once §4 phase 4 has landed; and the documentation of all of it.
+None of that requires a real organization, and none of it may be presented as production readiness.
+
+## 9. What was executed on 2026-10-19 (`./scripts/test-tenant-migration.sh`, 31 passed / 0 failed)
+
+The harness restores the deployed database into **throwaway** databases on the scratch container. The
+only statement it sends to the deployment is a read-only `pg_dump`.
+
+| Step | Result |
+| --- | --- |
+| Restore → apply 0004 | exit 0. 1 org, 4 canonical associations, 11 rows classified `test_fixture` with **0** associations, `parcels.district_id` 36/36, `land_documents` 34 of 36 (the 2 district-less rows stay NULL), 101 historical `user_jurisdictions` rows backfilled, no id/code drift |
+| Re-apply (idempotence) | exit 0; still 4 associations, still 1 organization |
+| Rollback | exit 0; districts column count back to 6, `organization_districts` gone, 0 organizations, all 36 parcels intact, the 0003 CHECK still enforced |
+| Re-apply after rollback | exit 0 |
+| Abort: parcel with `district_code='ghostville'` | aborted, **named `ghostville`**, and left no `districts.id` column and no organization — the transaction rolled back completely |
+| Abort: `ORG-DHAROHAR-DEMO` exists with a different name | aborted before writing |
+| Rollback with a human-made grant present | **refused** rather than deleting a real association |
+| Application against the migrated copy | `test:jurisdiction` 46/0 and `test:provisioning` 91/0, on both a psql-applied and a runner-applied database |
+| Integrity checker | 53 findings, identical before and after — no new finding class, nothing repaired |
+
+Two defects the harness caught that hand-reviewing would have missed: a `CHECK` containing a
+subquery (PostgreSQL rejects it outright — `cannot use subquery in check constraint`), and a
+`DROP CONSTRAINT` on the key that the new table references (which broke re-running the file at all).
+Both are now written as a `DO` block guard and an add-if-missing, and both were re-tested.
+
+**Then integrated.** `0004_canonical_districts_and_tenants.sql` is in `server/src/db/migrations/`
+(derived from the drill copy by `scripts/build-tenant-migration.mjs`, which strips only `\set`,
+`BEGIN;` and `COMMIT;` — the runner owns the transaction) and was applied to the demo deployment:
+`ledger=0001,0002,0003,0004`, `organizations=1` (`Dharohar Demo Organization`), 4 associations,
+11 unmapped fixtures, 36/36 parcels and 34/36 documents carrying `district_id`, API healthy, and the
+full gate **43 checks green** with the migration assertion now requiring all four files.
+
+**One operational trap found while doing it:** the `migrate` service reads the migrations directory
+*baked into the image*, so adding a migration file does not take effect until the image is rebuilt —
+and with no registry access, that rebuild cannot happen at all. On this machine it was worked around
+by running the same `dist-server/db/migrate.js` with the host directory mounted read-only; the
+runbook now states the requirement plainly instead of leaving it to be discovered mid-upgrade.
+

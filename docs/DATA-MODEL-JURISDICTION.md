@@ -260,17 +260,25 @@ to a district this officer holds" — and, for a tenant-aware deployment, "…in
 organization". Two prerequisites are unmet:
 
 * `organizations` has no rows on any deployment, and `districts.organization_id` is NULL everywhere,
-  so an organization-scoped policy has nothing to match on. Draft migration
-  `server/src/db-draft/0004_org_scoped_district_registry.sql` is written for this and deliberately
-  refuses to run against that state: with no tenants recorded it aborts with `[TENANCY_UNDECISIONED]`,
-  and with some districts attributed and some not it aborts with `[TENANCY_AMBIGUOUS]` and names the
-  unattributed codes. Both refusals were executed against a seeded scratch database, and because the
-  file runs inside one transaction, the abort left no `districts.id` column behind — "nothing was
-  changed" is literally true rather than a reassurance.
-* The district registry is still **global**: `code` is the primary key and
-  `ux_districts_canonical_name` makes a name unique across every organization. Until that is
-  org-scoped, "cross-tenant" isolation has no meaning in the schema, and a policy that pretended
-  otherwise would be enforcing a distinction the data cannot represent.
+  so an organization-scoped policy has nothing to match on. Migration `0004`
+  (`server/src/db/migrations/0004_canonical_districts_and_tenants.sql`) has now created that
+  structure — a stable district identifier, `organization_districts` as the explicit many-to-many
+  relationship, and `Dharohar Demo Organization` as the only tenant — and it deliberately refuses to
+  guess: with an unresolved `district_code` it aborts naming the code, and the 11 test-suite
+  `probe %` districts were classified `test_fixture` and given **no** organization relationship at all.
+  The abort paths and the rollback were executed against disposable copies
+  (`./scripts/test-tenant-migration.sh`, `docs/DISTRICT-TENANCY-MODEL.md` §9). What still blocks the
+  policy is not the schema: it is that the only tenant in existence is a demo one, so a
+  cross-organization policy would have nothing real to separate.
+* The registry has a stable identifier now (`districts.id`, referenced by `organization_districts`
+  and backfilled onto the four child tables), but **the application still reads and writes the old
+  natural key**: `code` remains the primary key, `ux_districts_canonical_name` still makes a district
+  name unique across the whole deployment, and the four child foreign keys still point at
+  `districts(code)`. Migration 0005 is what removes them, and it is deliberately separate — once the
+  global name constraint is gone, a duplicate name becomes insertable, so every read path must already
+  be keyed on the identifier before that day. Until 0005, "cross-tenant isolation" is not yet
+  expressible in a policy, and a policy that pretended otherwise would enforce a distinction the data
+  cannot represent.
 
 So the honest status is: the role barrier that made RLS impossible is gone, the policy itself is
 unwritten, and the first line of policy work is a decision about tenancy — not a `CREATE POLICY`.
