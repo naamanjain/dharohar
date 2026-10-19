@@ -55,6 +55,15 @@ async function main() {
   // worse than no report, because someone will sign off on it.
   console.log(`  database: ${health.database ?? '(unknown)'}`);
   console.log(`  migration 0003 (stable district_code columns): ${have0003 ? 'applied' : 'not applied'}`);
+  // And the whole ledger, not one migration. Naming only 0003 made this header read as if it had
+  // verified the schema state after 0004 and 0005 had already changed what "consistent" means: the
+  // reader should see which files the database says it has, on the line above the findings.
+  let ledger = '(schema_migrations is not readable)';
+  try {
+    const rows = (await pool.query('select version from schema_migrations order by version')).rows.map((r: any) => r.version);
+    ledger = rows.length ? rows.join(', ') : '(no migration recorded — a database the runner has never touched)';
+  } catch { /* reported by the string above rather than crashing a read-only diagnostic */ }
+  console.log(`  migrations recorded: ${ledger}`);
   console.log('============================================================\n');
 
   const findings: Finding[] = [];

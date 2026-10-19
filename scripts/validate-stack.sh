@@ -84,6 +84,15 @@ chk "district foreign key to districts(code) exists" "4" "$(q "select count(dist
 # would pass on a database where the triggers call something else.
 chk "district sync trigger attached to all 4 district-carrying tables" "4" "$(q "select count(*) from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_proc p on p.oid = t.tgfoid where not t.tgisinternal and c.relname in ('parcels','land_documents','users','user_jurisdictions') and t.tgname = 'trg_' || c.relname || '_district_code' and p.proname = 'dharohar_sync_district_code'")"
 chk "postgis extension present" "1" "$(q "select count(*) from pg_extension where extname='postgis'")"
+# Migration 0005 moved the registry's identity from the name to the surrogate key and applied the
+# owner's two demo-environment decisions. Asserted as objects, not as a ledger row: a recorded
+# migration that did not take effect is exactly what this gate exists to catch.
+chk "districts primary key is the identifier, not the name" "id" "$(q "select a.attname from pg_constraint c join pg_attribute a on a.attrelid=c.conrelid and a.attnum=any(c.conkey) where c.conrelid='districts'::regclass and c.contype='p'")"
+chk "the four mapped districts carry the state code the owner supplied" "4" "$(q "select count(*) from districts where code in ('ajmer','jaipur','jodhpur','udaipur') and state_code='RJ' and kind='canonical'")"
+chk "no test-suite fixture is presented as canonical geography" "0" "$(q "select count(*) from districts where code like 'probe %' and kind = 'canonical'")"
+chk "retired fixtures are refused for new writes (inactive)" "0" "$(q "select count(*) from districts where kind='retired' and is_active")"
+chk "children reference the identifier as well as the code" "4" "$(q "select count(*) from pg_constraint where conname in ('fk_parcels_district_id','fk_land_documents_district_id','fk_users_district_id','fk_user_jurisdictions_district_id')")"
+chk "no record has a district code that the registry cannot answer" "0" "$(q "select (select count(*) from parcels where district_code is not null and district_id is null) + (select count(*) from users where district_code is not null and district_id is null) + (select count(*) from land_documents where district_code is not null and district_id is null) + (select count(*) from user_jurisdictions where district_code is not null and district_id is null)")"
 
 echo "=== seed demo data (explicitly authorised) then T5/T11 persistence across restart ==="
 docker compose -f docker-compose.prod.yml exec -T -e SEED_CONFIRM=demo -e DEMO_PASSWORD="$DEMO_PASSWORD" api node dist-server/db/seed.js >/dev/null 2>&1
@@ -199,7 +208,9 @@ if [ -n "${ADMIN_PASSWORD:-}" ]; then
     npx tsx server/src/test_provisioning_suite.ts > /tmp/validate-provisioning.log 2>&1
   chk "test:provisioning passes" "0" "$?"
 else
-  echo "  FAIL  ADMIN_PASSWORD not exported — provisioning suite not run (bootstrap: npm run db:bootstrap-admin)"; FAIL=$((FAIL+1))
+  echo "  FAIL  ADMIN_PASSWORD not exported — provisioning suite not run here. Export the bootstrap"
+  echo "        administrator's own password and re-run, or use ./scripts/test-authorization-on-copy.sh,"
+  echo "        which runs provisioning against a disposable copy with an administrator of its own."; FAIL=$((FAIL+1))
 fi
 
 echo "=== T13 the gate retires the officers it created ==="
@@ -219,6 +230,20 @@ if grep -qE 'account\(s\) revoked and locked|holds USER_ADMIN' /tmp/validate-ret
 else
   echo "  FAIL  retirement exited 0 without saying what it did — read /tmp/validate-retire.log"; FAIL=$((FAIL+1))
 fi
+
+echo "=== T13b the owner's standing fixture-retirement decision is re-applied ==="
+# The owner decided on 2026-10-19 that probe-pattern districts are test fixtures, not geography, and
+# migration 0005 retired every row matching that pattern. The declare path still inserts with the
+# column default, so each suite run adds a NEW probe district that arrives classified 'canonical' —
+# which is how `probe 790279` got into the registry in the first place. Re-applying the standing
+# decision keeps the gate repeatable; changing the default is a governance decision, recorded as an
+# open item rather than made here. Runs as the schema owner because dharohar_app has no UPDATE on the
+# registry by design.
+q "update districts set kind='retired', is_active=false, retired_at=coalesce(retired_at, now()),
+     notes=btrim(coalesce(notes,'') || ' [validate-stack] retired by the owner decision of 2026-10-19: test-suite fixture, not canonical geography.')
+     where code like 'probe %' and kind <> 'retired'" >/dev/null
+chk "no probe-pattern district is presented as canonical geography after this run" "0" "$(q "select count(*) from districts where code like 'probe %' and kind not in ('retired','test_fixture')")"
+chk "retired fixtures are inactive" "0" "$(q "select count(*) from districts where kind='retired' and is_active")"
 
 echo
 echo "=== RESULT: $PASS passed, $FAIL failed ==="

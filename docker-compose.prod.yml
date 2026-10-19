@@ -15,7 +15,7 @@ name: dharohar-prod
 #                           and by `migrate` and `roleinit` to run DDL and grant privileges. The API
 #                           never sees it. Generate with `openssl rand -hex 24`.
 #   DHAROHAR_APP_PASSWORD : the RUNTIME identity's password (role dharohar_app: no superuser, no
-#                           DDL, append-only audit). Generate with `openssl rand -base64 32`.
+#                           DDL, append-only audit). Generate with `openssl rand -hex 32` — NOT base64: a `/` or `+` in the password breaks the DATABASE_URL that compose interpolates.
 #   JWT_SECRET            : token signing secret.
 # Each is `${VAR:?...}`, so an unset value aborts the command instead of substituting a default.
 #
@@ -37,7 +37,7 @@ x-owner-url: &owner-url postgresql://${POSTGRES_USER:-dharohar}:${POSTGRES_PASSW
 # password, so a compromised API cannot alter schema, drop a table or rewrite the audit chain.
 x-app-credentials: &app-credentials
   PGUSER: ${DHAROHAR_APP_USER:-dharohar_app}
-  PGPASSWORD: ${DHAROHAR_APP_PASSWORD:?DHAROHAR_APP_PASSWORD is not set - generate one with 'openssl rand -base64 32'; this is the password of the least-privilege role dharohar_app that scripts/roles.sql creates}
+  PGPASSWORD: ${DHAROHAR_APP_PASSWORD:?DHAROHAR_APP_PASSWORD is not set - generate one with 'openssl rand -hex 32' (hex, NOT base64, because a / or + in the password breaks the interpolated DATABASE_URL); this is the password of the least-privilege role dharohar_app that scripts/roles.sql creates}
 
 services:
   db:

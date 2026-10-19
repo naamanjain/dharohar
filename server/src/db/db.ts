@@ -158,11 +158,19 @@ export async function initDbConnection(): Promise<DbHealth> {
       client.release();
     }
   } catch (err: any) {
+    // pg reports an unparseable connection string as "Invalid URL", which names neither the setting
+    // nor the cause. The cause is almost always the password: compose interpolates it into
+    // DATABASE_URL raw, and base64 alphabet includes / and +, both of which break the URL.
+    const parseFailure = /invalid url|ERR_INVALID_URL/i.test(String(err?.message || ''));
+    const cause = parseFailure
+      ? ' — DATABASE_URL itself does not parse. Generate database passwords with `openssl rand -hex 32`:'
+        + ' a base64 password can contain / or +, which compose interpolates into the connection string raw.'
+      : '';
     if (IS_PRODUCTION) {
       // A production instance that quietly drops to the in-memory store accepts writes that look
       // successful and vanish on restart. For land records that is data loss, so refuse instead.
-      console.error('[DHAROHAR DB] FATAL: PostgreSQL is unreachable in production mode:', err.message);
-      throw new Error(`Production startup requires a reachable PostgreSQL database: ${err.message}`);
+      console.error('[DHAROHAR DB] FATAL: PostgreSQL is unreachable in production mode:', err.message + cause);
+      throw new Error(`Production startup requires a reachable PostgreSQL database: ${err.message}${cause}`);
     }
     activeStorageMode = 'dev-fallback';
     connectedDatabaseName = '';

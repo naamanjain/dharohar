@@ -199,18 +199,27 @@ defect — but it is a real dependency for a government network.
 6. **Document bytes live in PostgreSQL TEXT columns** (base64) — see `docs/DOCUMENT-STORAGE.md`;
    confidentiality depends on the database backup chain, and the "checksum" is over the stored text
    plus the data URI, not over independently verifiable file bytes.
-7. **Row-Level Security is still not implemented — but the role obstacle is gone.** As of
+7. **Row-Level Security is still not implemented, and it is now measurable what that means.** As of
    2026-10-19 the shipped compose stack connects as the least-privilege `dharohar_app`
    (`superuser=false`, `bypassrls=false`, DDL/TRUNCATE/DELETE/audit-UPDATE/ledger-INSERT refused by
    PostgreSQL itself — see `scripts/probe-role.mjs`), and the schema-owner credential is held only by
-   the one-shot `migrate`/`roleinit`/`maint` services. What is missing is the policy and the
-   per-transaction GUC. Migration 0004 (applied 2026-10-19) supplied the tenant structures the policy
-   needs to reference — `organization_districts` as an explicit many-to-many, a stable district
-   identifier, and `district_id` on the four child tables — but two things still make a tenant policy
-   unwriteable: the only organization that exists is the **demo** one, and the application still keys
-   on the old natural key until 0005 removes the global name constraint and repoints the foreign keys.
-   Order of work: `docs/DATA-MODEL-JURISDICTION.md` §3.2 and `docs/DISTRICT-TENANCY-MODEL.md` §4.
-   Until policies exist, application authorization is the only layer.
+   the one-shot `migrate`/`roleinit`/`maint` services. Migration 0004 supplied the tenant structures
+   (`organizations`, `organization_districts`, `organization_units`) and migration 0005 — applied to
+   the demo deployment on 2026-10-20 — made the district identifier the primary key, repointed the
+   child foreign keys at it and kept the code foreign keys as the backstop. The schema is therefore
+   settled; what remains is the policy, the per-transaction GUC, and two data facts:
+   * **nothing is labelled.** Measured on the deployed demo database on 2026-10-20: `organization_id`
+     is NULL on 39 of 39 parcels and on 59 of 59 users, and `land_documents` has no `organization_id`
+     column at all. A tenant policy has no column to filter on yet.
+   * **the application does not consult the tenant at all.** `server/src/services/jurisdiction.ts`
+     authorizes from `user_jurisdictions`; `organizations` and `organization_districts` are read by
+     nothing in the request path. Measured by `server/src/test_tenancy_isolation_suite.ts` on a
+     disposable copy: an officer belonging to a *different* organization, granted the same district
+     personally, reads another organization's parcel with **HTTP 200**, and the record appears in that
+     district's listing. The suite is 17 passed / 4 failed and is expected to stay red until tenant
+     scoping exists — it is the specification RLS has to satisfy, not a regression.
+   Order of work: the labelling decision in `docs/DISTRICT-TENANCY-MODEL.md` §8, then §4 of that file,
+   then the policy. Until policies exist, application authorization is the only layer.
 7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every
    `land_documents` row in the deployment has an empty `image_uri` — OCR text and metadata, no source
    bytes. The one exception is the 1.5 MB payload written deliberately as a backup-drill fixture, and

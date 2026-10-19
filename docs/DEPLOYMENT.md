@@ -273,18 +273,49 @@ be transacted. It never drops, truncates or reseeds. Re-running it is a no-op.
 
 **Adding a migration file is not enough on a containerised deployment.** The `migrate` one-shot reads
 the migrations directory *baked into the image*, so a newly added file is invisible until the image is
-rebuilt — `docker compose build api` (or `up -d --build`) before `docker compose run --rm migrate`.
-Discovered the hard way on 2026-10-19: `run --rm migrate` reported "No pending migrations. 3 applied"
-while the fourth file sat on the host, and the run also failed outright with no registry access to
-rebuild from. Two ways to check rather than assume:
+rebuilt. Discovered the hard way on 2026-10-19: `run --rm migrate` reported "No pending migrations.
+3 applied" while the fourth file sat on the host. Re-running it on 2026-10-20 for migration 0005 said
+"4 applied, schema up to date" *and* warned that 0004's file had vanished — same cause, and it needed
+`--profile tools build migrate` as well as `build api`, because the `migrate` service has its own
+`build:` block and is a separate image. Building works from the local layer cache; no registry access
+is required. Check rather than assume:
 
 ```bash
-docker compose -f docker-compose.prod.yml run --rm migrate   # says what it sees
-docker compose -f docker-compose.prod.yml exec -T api ls dist-server/db/migrations   # what is baked in
+docker compose -f docker-compose.prod.yml run --rm migrate      # says what it sees
+docker compose -f docker-compose.prod.yml exec -T api ls dist-server/db/migrations   # baked into api
+docker run --rm --entrypoint sh dharohar-prod-migrate:latest -c 'ls -1 /app/dist-server/db/migrations'
 ```
 
-The second command lists the files the runner can actually apply. If a filename is missing there, the
-image is stale and no amount of re-running `migrate` will change that.
+If a filename is missing from either listing, the image is stale and no amount of re-running `migrate`
+will change that. Rebuild both, then apply:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tools build migrate api
+docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
+```
+
+### Prove a migration on a copy before the runner ever sees it
+
+Two scripts exist so a schema change is executed against a throwaway database, never against the only
+copy of the working data:
+
+```bash
+./scripts/test-tenant-migration.sh        # 65 assertions: apply, idempotence, rollback, guards
+./scripts/test-authorization-on-copy.sh   # restore a copy, least-privilege API, three suites
+```
+
+The first takes a migration from `server/src/db-draft/NNNN_*.sql`, applies it, re-applies it, rolls it
+back with the matching `rollback-NNNN.sql` and proves the rollback really restored the previous
+trigger. The second restores the deployed database into a new database on the scratch PostGIS
+container, applies `scripts/roles.sql`, starts a temporary API as `dharohar_app`, bootstraps an
+administrator **on the copy only**, and runs the jurisdiction, provisioning and tenancy suites against
+it. Both drop everything they create on exit. Neither writes to `dharohar-prod-db-1` except a
+read-only `pg_dump`.
+
+Generate database passwords as **hex**, not base64: `openssl rand -hex 32`. Compose interpolates
+`DHAROHAR_APP_PASSWORD` into `DATABASE_URL` raw, and base64 can contain `/` or `+`, which makes the
+URL unparseable — the API then refuses to start in production with `Invalid URL`, which is correct
+behaviour but names neither the setting nor the cause.
 
 ### Do not seed a real database
 
@@ -307,7 +338,7 @@ database role and grants/revokes exactly what the API needs. It is **additive on
 a role, a table, another role's grants or any data. It requires a password passed in, never embedded:
 
 ```bash
-export DHAROHAR_APP_PASSWORD="$(openssl rand -base64 32)"     # never commit it
+export DHAROHAR_APP_PASSWORD="$(openssl rand -hex 32)"        # never commit it
 docker compose -f docker-compose.prod.yml exec -T \
   -e PGPASSWORD="$POSTGRES_PASSWORD" db \
   psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-psqlrc -q -v ON_ERROR_STOP=1 \

@@ -213,11 +213,24 @@ the only tenant that exists, and which asserts nothing about real administration
 
 **Needs a person (a department, or the owner acting for it). The code cannot decide these:**
 
-1. **The eleven `probe NNNNNN` districts and the eleven parcels under them.** Retire the rows, or delete
-   the parcels (nothing hard-deletes by design), or promote some to real districts. They are test
-   residue; the tenancy migration deliberately refuses to dress them up as geography.
-2. **Which state each canonical district belongs to** (`state_code`). Currently NULL everywhere, and
-   `NULL` in the unique key means a shared name cannot be resolved without someone saying which state.
+1. ~~**The eleven `probe NNNNNN` districts and the eleven parcels under them.**~~ **DECIDED and applied
+   2026-10-20.** The owner directed that all probe-pattern districts be retired while their parcels
+   remain as isolated synthetic fixtures, preserving history and refusing new writes. Migration 0005
+   implements that by pattern rather than by name list, so a fixture minted between runs is caught too
+   — it retired 12 rows, including `probe 790279`, which had escaped into `kind='canonical'`.
+2. ~~**Which state each canonical district belongs to** (`state_code`).~~ **DECIDED and applied
+   2026-10-20.** Ajmer, Jaipur, Jodhpur and Udaipur are `RJ`, badged in `notes` as a mapping for the
+   synthetic demo environment and explicitly not a certification of real land records. The remaining
+   NULLs are honest: nothing in this database is real geography.
+2b. **Which organization owns each existing record — the one that now blocks RLS.** No migration has
+   ever written `parcels.organization_id` or `users.organization_id`; measured 2026-10-20, they are NULL
+   on 39/39 parcels and 59/59 users, and `land_documents` has no such column. Two ways to answer:
+   inherit the tenant that administers the record's district, or label by hand. Either is a decision;
+   guessing is not available, and RLS cannot be written before one is made.
+2c. **What a declaration means.** `districts.kind` defaults to `'canonical'`, so declaring a district —
+   which the provisioning suite does through the API — creates canonical geography immediately. That
+   default should probably become a candidate state requiring approval, but that is a governance choice
+   about who may create registry rows, not a technical one.
 3. **Whether more than one organization may administer the same district in the same state**, and under
    which relationship kind — the schema permits it; only governance says whether it is allowed.
 4. **What the real organizations are** (names, hierarchy, who may grant an association) and the identity
@@ -234,7 +247,7 @@ to intersect `user_jurisdictions` with `organization_districts`, exercised by ne
 negative tests; the RLS policy design once §4 phase 4 has landed; and the documentation of all of it.
 None of that requires a real organization, and none of it may be presented as production readiness.
 
-## 9. What was executed on 2026-10-19 (`./scripts/test-tenant-migration.sh`, 31 passed / 0 failed)
+## 9. What was executed on 2026-10-19 (`./scripts/test-tenant-migration.sh`, 31 assertions at the time — the file covers 0005 too now, see §10)
 
 The harness restores the deployed database into **throwaway** databases on the scratch container. The
 only statement it sends to the deployment is a read-only `pg_dump`.
@@ -261,11 +274,102 @@ Both are now written as a `DO` block guard and an add-if-missing, and both were 
 `BEGIN;` and `COMMIT;` — the runner owns the transaction) and was applied to the demo deployment:
 `ledger=0001,0002,0003,0004`, `organizations=1` (`Dharohar Demo Organization`), 4 associations,
 11 unmapped fixtures, 36/36 parcels and 34/36 documents carrying `district_id`, API healthy, and the
-full gate **43 checks green** with the migration assertion now requiring all four files.
+full gate **43 checks green** with the migration assertion now requiring all four files. (That count is
+the state of the gate on 2026-10-19; with 0005 and its object checks it is 52 passing plus the one
+honest failure described in §10.1.)
 
 **One operational trap found while doing it:** the `migrate` service reads the migrations directory
-*baked into the image*, so adding a migration file does not take effect until the image is rebuilt —
-and with no registry access, that rebuild cannot happen at all. On this machine it was worked around
-by running the same `dist-server/db/migrate.js` with the host directory mounted read-only; the
-runbook now states the requirement plainly instead of leaving it to be discovered mid-upgrade.
+*baked into the image*, so adding a migration file does not take effect until the image is rebuilt.
+`run --rm migrate` reported "No pending migrations. 4 applied" against an image that carried only
+three files — and it also warned that 0004's file had vanished, which is the same fact seen from the
+other side. Rebuilding is `docker compose -f docker-compose.prod.yml --profile tools build migrate
+api`: it works from the local layer cache with no registry access, which the note written on 2026-10-19
+got wrong. Both the build and the apply were re-run on 2026-10-20 for migration 0005 (§10), and the
+file list was verified *inside* the image before the runner was trusted — `ls` in a running container
+is the only proof that the artifact being executed is the artifact that was edited.
+
+## 10. Migration 0005 executed (2026-10-20) — and the tenancy tests it unlocked
+
+`0005_district_identifier_authority.sql` implements the owner's two decisions and then makes the
+identifier authoritative. Verified first by `./scripts/test-tenant-migration.sh` on a disposable copy:
+**65 assertions passed, 0 failed** (up from 31 for 0004; the file now also covers 0005, its rollback
+and the guards). Then applied to the demo deployment by the runner.
+
+Measured after the apply on `dharohar-prod-db-1`:
+
+| | result |
+| --- | --- |
+| `schema_migrations` | `0001,0002,0003,0004,0005` |
+| `districts` primary key | `id` (the identifier), with `ux_districts_code` keeping the name resolvable |
+| state code `RJ` | 4 canonical districts — Ajmer, Jaipur, Jodhpur, Udaipur — badge-noted as demo-environment mapping |
+| probe-pattern rows | 12 retired, all inactive; their parcels untouched (39 → 39) |
+| children referencing the identifier | `fk_parcels_district_id`, `fk_land_documents_district_id`, `fk_users_district_id`, `fk_user_jurisdictions_district_id` |
+| children still referencing the code | the four `fk_*_district_code` constraints, kept deliberately as the backstop when triggers are bypassed |
+| codes with no identifier | 0 across all four child tables |
+
+Three findings came out of running it rather than reading it:
+
+1. **A live-only condition the drill could not see.** `probe 790279` was declared at 16:19:54Z, after
+   0004 had already run, and `districts.id` had no DEFAULT until 0005 — so it landed with a NULL
+   identifier, and the parcel written against it could never be mapped. The first live apply aborted
+   with `[DISTRICT_UNRESOLVED]`, correctly refusing to guess. 0005 now mints identifiers for registry
+   rows that were written without one (section 2), which creates no district and re-homes no record.
+   The drill was extended to plant that exact condition — a post-0004 declaration through the ordinary
+   write path — and 0005 is asserted to heal it and say so.
+2. **`session_replication_role = replica` disables referential-integrity triggers too**, so the probe
+   that was supposed to prove the code backstop bites was actually proving nothing: with the role set,
+   the FK is off along with the user trigger and the ghost row inserts. Disabling the sync trigger
+   *by name* keeps RI enforced (verified separately), and that is what the assertion now does — after
+   first echoing that its own `UPDATE` ran, because a `#`-prefixed comment inside a psql heredoc is a
+   syntax error in SQL and had been silently skipping the statement for a whole run.
+3. **The baseline check was not a check.** The harness picks a pre-0004 dump by reading its TOC, and
+   treated "pg_restore printed nothing" as "no organization_districts", so a failed mount read as an
+   old dump and the drill upgraded a baseline that was already migrated — 12 red assertions whose
+   common cause was the premise. Selection now fails closed on an unreadable TOC, and the premise is
+   re-asserted against the *restored database* (`to_regclass('organization_districts') is null`)
+   before anything is applied.
+
+### 10.1 Authorization on a disposable copy — `scripts/test-authorization-on-copy.sh`
+
+The provisioning suite needs a `USER_ADMIN` login and the tenancy suite needs a second organization.
+Neither belongs in the demo database, and the bootstrapped administrator's password is deliberately
+not recoverable, so both run against a copy with the API connected as `dharohar_app`. Results,
+2026-10-20:
+
+| suite | result |
+| --- | --- |
+| `test:jurisdiction` | **46 passed, 0 failed** |
+| `test:provisioning` | **91 passed, 0 failed** |
+| `test_tenancy_isolation_suite.ts` | **17 passed, 4 failed** |
+| harness checks (restore, roles, least-privilege, DDL denial, bootstrap) | all passed; the API's own identity read from `pg_stat_activity` was `dharohar_app` |
+
+The tenancy suite is the pre-RLS measurement requested before designing any policy. Per-district
+isolation, multi-district officers, immediate revocation and the state-wide read-only auditor all
+hold. The four failures are the requirement, not flakiness:
+
+| failure | measurement |
+| --- | --- |
+| An officer of one organization cannot read another organization's record in a district both are granted | **HTTP 200** — the request path never consults `organizations` or `organization_districts` |
+| The district listing does not return another organization's records | the record appears in the list |
+| Every parcel carries an organization | **39 of 39** parcels have `organization_id IS NULL` on the deployed demo database |
+| Every officer carries an organization | **59 of 59** users have `organization_id IS NULL` |
+
+The first two are one defect seen twice: tenant scoping is unenforced. The last two are the reason
+RLS cannot be written yet — a policy has nothing to filter on. `land_documents` has no
+`organization_id` column at all. Converting these NULLs is a mapping decision (inherit the tenant
+that administers the parcel's district, or label by hand), not a migration an agent may choose.
+
+Full-stack gate after 0005: `./scripts/validate-stack.sh` **52 passed, 1 failed** — the failure is
+`ADMIN_PASSWORD not exported`, i.e. provisioning was not run *against the live stack*, which is the
+correct outcome for a stack whose administrator password the operator has not supplied; it ran green
+(91/0) against the copy. `npm test` is 53/0 and `npm run lint` is clean.
+
+### 10.2 A standing decision that needs re-applying, and one that needs making
+
+`districts.kind` defaults to `'canonical'`. Every suite run therefore mints a probe district that
+arrives as canonical geography — that is how `probe 790279` got there. `validate-stack.sh` now
+re-applies the owner's existing retirement decision at the end of each run (T13b) so the gate stays
+repeatable; changing the **default** so that a declaration is not automatically canonical geography is
+a governance decision and is listed in §8 rather than made here.
+
 

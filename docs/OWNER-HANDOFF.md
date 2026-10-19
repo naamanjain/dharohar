@@ -69,7 +69,7 @@ missing one stops the deployment instead of quietly using a guess.
 1. Generate the values **on the VM**, in the terminal, so they never sit in your browser history:
    ```bash
    openssl rand -hex 24    # POSTGRES_PASSWORD  (schema owner / maintenance)
-   openssl rand -base64 32 # DHAROHAR_APP_PASSWORD (the API's runtime role)
+   openssl rand -hex 32    # DHAROHAR_APP_PASSWORD (the API's runtime role; hex, not base64)
    openssl rand -hex 32    # JWT_SECRET         (signs login tokens)
    openssl rand -hex 12    # DEMO_PASSWORD      (demo personas only — never a real officer's password)
    ```
@@ -105,7 +105,7 @@ docker compose -f docker-compose.prod.yml up -d --build
 docker compose -f docker-compose.prod.yml ps
 ```
 
-What happens by itself, in this order: `db` starts → `migrate` applies the three migrations as the
+What happens by itself, in this order: `db` starts → `migrate` applies the five migrations as the
 owner and exits → `roleinit` creates/refreshes the least-privilege role and exits → `api` starts
 **as that role** and waits for `/api/health/ready` → `web` starts. If any step fails, the next one does
 not start; that is deliberate, so a half-built system never serves officers.
@@ -125,6 +125,49 @@ Check it is genuinely talking to PostgreSQL, not to a fallback:
 curl -s http://127.0.0.1:8088/api/health | head -c 300
 # you want: "storageMode":"postgres-postgis" and "database":"dharohar"
 ```
+
+---
+
+## 4b. Synthetic staging at ₹0 — no domain, no certificate, nothing public
+
+Use this shape until the blockers in §9 are closed. It is the same compose stack; the only difference is
+that **nothing but SSH is reachable from the internet**, so there is no DNS, no certificate, and no
+attack surface to defend while the data is still fabricated.
+
+**You do these, in this order.**
+
+1. Cloud firewall / security list: allow ingress on **22 only**, ideally restricted to your own current
+   IP. Do not add 80, 443, 3001 or 5432. There is no reason to open them for staging, and closing them
+   later is how an accidental public deployment gets forgotten about.
+2. Deploy exactly as §4 (`docker compose -f docker-compose.prod.yml up -d --build`), and **skip §5
+   entirely**. The compose file publishes the web container on `127.0.0.1:8088` by default (`WEB_BIND`),
+   so it is already loopback-only — confirm it rather than trusting the file:
+   ```bash
+   sudo ss -ltnp | grep -E ':(80|443|3001|5432|8088)\b'
+   ```
+   Every line must show `127.0.0.1` on the left-hand address column. A `0.0.0.0` or `*` next to any of
+   those ports means something is exposed, and the run stops being staging.
+3. Seed the synthetic data and create the administrator (§4 and §6). Both are demo-only writes and both
+   refuse to run without the confirmation flags they show.
+4. From **Windows PowerShell**, open a tunnel to your own laptop:
+   ```powershell
+   ssh -i "$env:USERPROFILE\.ssh\your-key.pem" -N -L 8088:127.0.0.1:8088 ubuntu@<SERVER_IP>
+   ```
+   Leave that window open. Then browse to `http://127.0.0.1:8088` on the laptop. The traffic is
+   encrypted by SSH; there is no browser padlock, and that is expected on a loopback URL.
+5. Run the suites **from the laptop** with the tunnel up — this is why staging does not need Node on the
+   VM. In Git Bash, from the repository:
+   ```bash
+   set -a; . ./.env; set +a
+   TEST_BASE_URL=http://127.0.0.1:8088/api DEMO_PASSWORD="$DEMO_PASSWORD" \
+     npx tsx server/src/test_jurisdiction_suite.ts
+   ```
+   46 checks. Cross-district access must all be denied.
+6. Back up on a schedule and get the dump **off the VM** (§8). A staging box with no off-machine copy is
+   a machine that will lose its data and its proof at the same time.
+
+What this staging does **not** prove: public reachability, TLS, DNS, the ARM image, capacity under real
+traffic, or anything about tenant isolation. Those are in §9 and in `docs/SECURITY.md` §"open items".
 
 ---
 
@@ -227,20 +270,39 @@ and restored copy, and the audit chain verified through the API as valid across 
 
 ## 9. What only you (or the department) can decide
 
-1. **Who owns a district.** Migration 0004 has been applied and created the structure — a stable
-   district identifier, an explicit `organization_districts` relationship, and one tenant named
-   `Dharohar Demo Organization` — and it refused to guess anything beyond that. The eleven
-   `probe NNNNNN` districts the test suites created are classified `test_fixture` and mapped to **no**
-   organization, while eleven parcels still reference them. Retire them, or say which real district
-   each is; that is a person's decision, not a script's. `districts.state_code` is also NULL
-   everywhere, and the next migration cannot install name+state uniqueness while that is true.
-2. **The real district list.** Everything in the registry today was derived from values the demo data
+1. **Which organization each record belongs to — this is now the blocking one.** Migrations 0004 and
+   0005 have been applied: the district identifier is the primary key, `organization_districts` is the
+   explicit relationship, Ajmer/Jaipur/Jodhpur/Udaipur carry `state_code='RJ'` as a demo-environment
+   mapping, and all 12 `probe %` fixtures are retired with their parcels kept as isolated synthetic
+   history. What still has no owner is the record itself. Measured on the deployed demo database on
+   2026-10-20: `organization_id` is NULL on **39 of 39 parcels** and **59 of 59 users**, and
+   `land_documents` has no `organization_id` column at all. Until that is decided, a tenant policy has
+   nothing to filter on and the cross-organization leak in the next item cannot be closed by RLS.
+   The decision is: inherit the tenant that administers the parcel's district, or label records by
+   hand. `docs/DISTRICT-TENANCY-MODEL.md` §8 holds the options.
+2. **Tenant enforcement is not implemented, and it is now measured.** An officer belonging to a second
+   organization, personally granted the same district, reads another organization's parcel with
+   **HTTP 200**, and the record appears in that district's listing. That is the result of
+   `server/src/test_tenancy_isolation_suite.ts` (17 passed / 4 failed against a disposable copy), which
+   is expected to stay red until the application consults `organizations` at all — today it authorizes
+   only from `user_jurisdictions`. Do not add two real organizations to one database before this is
+   green.
+3. **A declared district is a canonical district by default.** `districts.kind` defaults to
+   `'canonical'`, so every declaration — including the ones the test suites make — arrives as
+   geography. That is how `probe 790279` got into the registry. The validation gate re-applies your
+   standing retirement decision on each run, but choosing what a *new* declaration means (candidate
+   until approved?) is a governance decision, not a script's.
+4. **The real district list.** Everything in the registry today was derived from values the demo data
    already contained. Declare the actual ones (`POST /api/admin/districts`) before treating any clean
    integrity report as authoritative.
-3. **Password policy for real officers.** The four demo personas share one environment-provided
-   password; that is fine for a demo and unacceptable for staff.
-4. **Whether `dharohar.urbantechx.in` is the final hostname**, and who is allowed to see it.
-5. **Retention and off-machine location for backups**, and who holds the encryption key.
+5. **Password policy for real officers.** The demo personas share one environment-provided password;
+   that is fine for a demo and unacceptable for staff. Note also that the bootstrapped administrator's
+   password cannot be recovered or reset by the bootstrap command by design — decide now who holds it
+   and where it is written down, because the provisioning suite cannot run without it
+   (`./scripts/test-authorization-on-copy.sh` is the alternative that needs nothing from you).
+6. **Whether `dharohar.urbantechx.in` is the final hostname**, and who is allowed to see it. For
+   synthetic staging (§4b) there is no hostname at all, which is the safer answer for now.
+7. **Retention and off-machine location for backups**, and who holds the encryption key.
 
 ---
 
@@ -254,11 +316,15 @@ Do not read this document as a claim that these were tested. They were not:
   reasonable target but this has not been executed on Arm.
 * **Production capacity / concurrent officers.** The containers are capped at 0.75 vCPU and 512 MB each;
   no load test was performed.
-* **Real record volumes.** All measurements are on synthetic demo data.
-* **Row-level security.** It is not implemented; see `docs/DATA-MODEL-JURISDICTION.md` §3.2 for the
-  decision that blocks it.
+* **Real record volumes.** Every measurement in this document is on synthetic demo data — 39 parcels,
+  59 accounts.
+* **Row-level security.** Not implemented, and per-district isolation is the only layer that exists.
+  The cross-organization behaviour that is missing is measured in item 2 above, not assumed.
 * **Restore from the off-machine copy.** The local restore drill passed; fetching an encrypted dump from
   a second location and restoring that has not been done, because no off-machine copy exists yet.
 
 Everything claimed as *done* in this document is backed by a command in `docs/DEPLOYMENT.md` §9 or by the
-validation gate (`./scripts/validate-stack.sh`), which prints its own pass/fail counts.
+validation gate (`./scripts/validate-stack.sh` — **52 passed, 1 failed** on 2026-10-20, the one failure
+being that provisioning was not run against the live stack because no administrator password was
+exported; it ran green against a disposable copy), and by `./scripts/test-tenant-migration.sh`
+(**65 passed, 0 failed**) and `./scripts/test-authorization-on-copy.sh`.

@@ -121,12 +121,18 @@ async function main() {
     console.log(`  note  scratch A ${A.name}\n`);
 
     const a1 = runServerScript('db/migrate.ts', A.url);
-    assert('A: db:migrate applies 0001..0003', a1.status === 0, a1.output);
+    assert('A: db:migrate applies every migration on disk', a1.status === 0, a1.output);
 
     const ac = new Client({ connectionString: A.url });
     await ac.connect();
     const ledger = await ac.query('select version, filename, checksum, runner from schema_migrations order by version');
-    assert('A: ledger records three applied migrations', ledger.rowCount === 3, `rows=${ledger.rowCount}`);
+    // Counted against the directory, not a literal 3. A hard-coded three went red the moment 0004
+    // and 0005 existed: the fact this assertion cares about is "the runner applied what is on disk",
+    // and a number that has to be edited every time a migration is added tests the calendar.
+    assert(`A: ledger records every migration file (${files.length})`, ledger.rowCount === files.length,
+      `rows=${ledger.rowCount} vs ${files.length} files: ${files.map((m) => m.version).join(',')}`);
+    assert('A: ledger includes 0003, the migration this suite is about',
+      ledger.rows.some((r: any) => r.version === '0003'), '0003 is not in schema_migrations');
     assert(
       'A: ledger checksums match the files on disk',
       files.every((m) => ledger.rows.some((r: any) => r.version === m.version && r.checksum === m.checksum)),
