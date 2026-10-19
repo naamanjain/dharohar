@@ -5,7 +5,7 @@
  */
 
 import crypto from 'crypto';
-import { JWT_EXPIRY_HOURS, JWT_SECRET, SEAL_SIGNING_KEY } from '../config/env';
+import { JWT_EXPIRY_HOURS, sealSigningKey, signingSecret } from '../config/env';
 import { AuthTokenPayload } from '../types/backend';
 
 /**
@@ -62,7 +62,7 @@ export function createJwtToken(payload: Omit<AuthTokenPayload, 'iat' | 'exp'>): 
 }
 
 function signHmac(message: string): string {
-  return crypto.createHmac('sha256', JWT_SECRET).update(message).digest('base64url');
+  return crypto.createHmac('sha256', signingSecret()).update(message).digest('base64url');
 }
 
 function hmacMatches(expected: string, provided: string): boolean {
@@ -172,7 +172,7 @@ export const GENESIS_AUDIT_HASH = '000000000000000000000000000000000000000000000
  */
 export function signSeal(material: Record<string, unknown>): string {
   const canonical = JSON.stringify(material, Object.keys(material).sort());
-  return crypto.createHmac('sha256', SEAL_SIGNING_KEY).update(canonical).digest('hex');
+  return crypto.createHmac('sha256', sealSigningKey()).update(canonical).digest('hex');
 }
 
 /**

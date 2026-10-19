@@ -65,7 +65,24 @@ chk "GET /api/health/ready -> 200" "200" "$(api "fetch('http://127.0.0.1:3001/ap
 
 echo "=== T3 db connectivity + T4 migrations recorded ==="
 chk "ready reports postgres-postgis" "postgres-postgis" "$(api "fetch('http://127.0.0.1:3001/api/health/ready').then(r=>r.json()).then(j=>console.log(j.storageMode))")"
-chk "schema_migrations has 0001" "1" "$(q "select count(*) from schema_migrations where version='0001'")"
+# Every migration file in the repository must appear in the ledger. The old check asked only for
+# 0001, so a stack that had never applied 0002 or 0003 — no jurisdiction tables, no district_code,
+# no foreign keys — still reported green. Version prefixes are compared individually so the failing
+# migration is named rather than a count mismatch being investigated later.
+MIG_FILES=$(ls -1 server/src/db/migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
+chk "ledger row count equals shipped migration count" "$MIG_FILES" "$(q "select count(*) from schema_migrations")"
+for f in server/src/db/migrations/*.sql; do
+  v=$(basename "$f" .sql); v=${v%%_*}
+  chk "migration $v is recorded as applied" "1" "$(q "select count(*) from schema_migrations where version='$v'")"
+done
+# 0003 is the one that changes what the API can accept, so its objects are verified directly rather
+# than inferred from a ledger row: the column, the foreign key and the write-time trigger must exist.
+chk "parcels.district_code exists" "1" "$(q "select count(*) from information_schema.columns where table_name='parcels' and column_name='district_code'")"
+chk "district foreign key to districts(code) exists" "4" "$(q "select count(distinct tc.table_name) from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name where tc.constraint_type='FOREIGN KEY' and tc.table_name in ('parcels','land_documents','users','user_jurisdictions') and kcu.column_name='district_code'")"
+# 0003 installs one trigger PER TABLE (trg_<table>_district_code) that all call the same function.
+# Asserting a single trigger name would fail on a correct database, and asserting the count alone
+# would pass on a database where the triggers call something else.
+chk "district sync trigger attached to all 4 district-carrying tables" "4" "$(q "select count(*) from pg_trigger t join pg_class c on c.oid = t.tgrelid join pg_proc p on p.oid = t.tgfoid where not t.tgisinternal and c.relname in ('parcels','land_documents','users','user_jurisdictions') and t.tgname = 'trg_' || c.relname || '_district_code' and p.proname = 'dharohar_sync_district_code'")"
 chk "postgis extension present" "1" "$(q "select count(*) from pg_extension where extname='postgis'")"
 
 echo "=== seed demo data (explicitly authorised) then T5/T11 persistence across restart ==="

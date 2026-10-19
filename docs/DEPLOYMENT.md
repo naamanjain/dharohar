@@ -225,7 +225,9 @@ plain HTTP on a public link both are readable by anyone on the path.
 ```bash
 cd dharohar
 
-# 1. Start the stack (migrations run automatically on API start; RUN_MIGRATIONS defaults to true)
+# 1. Start the stack. Compose runs the one-shot `migrate` (schema owner) and `roleinit` (grants) to
+#    completion before the API starts, and the API runs as the least-privilege role with
+#    RUN_MIGRATIONS=false — it is not allowed to write the migration ledger, by grant.
 docker compose -f docker-compose.prod.yml -f docker-compose.tls.yml up -d --build
 
 # 2. Confirm each layer
@@ -373,6 +375,59 @@ PGUSER=dharohar ./scripts/backup.sh \
   --input /var/backups/dharohar/dharohar_dharohar_20261016_152000.dump --create-db
 # Exit codes: 0 ok, 2 usage, 3 refused by the safety gate, 4 restore failed
 ```
+
+### The dump is not a backup until it leaves the machine
+
+Both the data volume and `./backups` live on the same host disk, so a lost VM destroys the records and
+their restore point together. Measured on 2026-10-19: dumps sat in `backups/` beside
+`/var/lib/docker/volumes/dharohar-prod_dharohar_pgdata` — one failure domain, which is what "no backup"
+means in practice. Copy each dump off-machine on the same schedule that makes it:
+
+```bash
+# Once a day, keep 30 days, and verify the copy before pruning the local file.
+cron: 30 2 * * * root /usr/local/bin/dharohar-backup && /usr/local/bin/dharohar-copy-offsite
+
+# dharohar-copy-offsite — any second location counts; two of these commands are ₹0-class options:
+#   (a) another cheap VM you own, over ssh (rsync needs a key, not a password)
+rsync -a --delete-after /var/backups/dharohar/ backupuser@second-host::dharohar/
+#   (b) an object store with a free tier, via rclone (server-side encryption at the provider)
+rclone copy /var/backups/dharohar "remote:dharohar-backups" --min-age 1m --checksum
+
+# Then prove the off-machine copy is the same file, not a truncated transfer:
+ssh backupuser@second-host 'cd dharohar && sha256sum -c dharohar_dharohar_<stamp>.dump.sha256'
+```
+
+Three rules that make this a backup rather than a copy:
+1. **Encrypt before it leaves.** The dump contains every document byte and officer row. `rclone crypt`,
+   or `age -r <recipient-key> file.dump -o file.dump.age`, before transfer — never a plaintext dump in a
+   cloud bucket you did not encrypt.
+2. **Restore-test the off-machine copy, not the local one.** Quarterly, pull a dump from the second
+   location and restore it into a disposable database and run the checks below. An unreadable archive is
+   the usual way a year of backups turns out to be nothing.
+3. **Never restore over the only copy.** `scripts/restore.sh` refuses a non-empty target and exits 3
+   unless you pass `--allow-non-empty`; do not pass that flag against a database holding real records.
+
+### What a restore drill has to prove (and what was proven on 2026-10-19)
+
+A restore is verified by these measurements, run against a **disposable** database — never the working
+one. The drill below was executed end to end on the current deployment; the results are measurements,
+not intentions.
+
+| Property | How to check it | Result measured |
+| --- | --- | --- |
+| Migrations carried | restore output lists `schema_migrations` | `0001`, `0002`, `0003` all present in the restored copy |
+| Spatial data | `select count(*) … where st_isvalid(geom)` | 33 of 33 parcels valid, 0 invalid |
+| Document bytes | `md5(split_part(image_uri,'base64,',2))` in source vs restored | **identical digest and length (2,000,000 chars)** — the payload survives the dump |
+| Record↔document links | `parcels.document_id` not null | 5 references intact |
+| Audit chain | start the API against the restored DB, `GET /api/verifications/audit-logs/verify-chain` | `isValid: true`, **1,379 entries** verified |
+| Application reads | `GET /api/parcels` through that API | HTTP 200, rows returned, `storageMode=postgres-postgis` |
+
+One caveat worth recording, because it would otherwise make the "document bytes" row meaningless: at the
+time of the drill the live database held **no** document payloads at all — `image_uri` was empty for all
+33 stored documents, so a backup/restore comparison would have passed vacuously. The drill therefore
+wrote a 1.5 MB synthetic payload through the real upload endpoint first, and compared that. Before any
+release, confirm on the actual production data that uploads populate `image_uri`; a register full of OCR
+text and no source images is not a digitized record set (see `docs/DOCUMENT-STORAGE.md`).
 
 Restore safety, by design: it **refuses a target that already holds user relations** (PostGIS's own
 `spatial_ref_sys` is ignored) and exits 3 rather than overwriting; nothing is ever dropped or

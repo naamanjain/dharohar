@@ -149,9 +149,11 @@ defect — but it is a real dependency for a government network.
 ## 5. Data-integrity rules the code enforces
 
 * No hard delete anywhere: parcels archive; audit rows are trigger-protected.
-* `RUN_MIGRATIONS` applies forward-only, additive SQL with a checksum ledger
-  (`schema_migrations`). Re-running is a no-op; a changed applied file aborts with a non-zero exit;
-  statements that cannot run inside a transaction are rejected before execution.
+* Migrations are applied by a one-shot `migrate` container running as the schema owner, forward-only,
+  additive SQL with a checksum ledger (`schema_migrations`). The API itself runs as a role holding
+  SELECT-only on that ledger, so it cannot apply or record a migration; `RUN_MIGRATIONS` defaults to
+  false for exactly that reason. Re-running is a no-op; a changed applied file aborts with a non-zero
+  exit; statements that cannot run inside a transaction are rejected before execution.
 * Booting never seeds. Demo seeding requires `SEED_CONFIRM=demo` and is refused in production
   without it; demo personas are disabled at module load in production.
 * Production never falls back to in-memory storage: an unreachable database at boot aborts startup,
@@ -197,11 +199,31 @@ defect — but it is a real dependency for a government network.
 6. **Document bytes live in PostgreSQL TEXT columns** (base64) — see `docs/DOCUMENT-STORAGE.md`;
    confidentiality depends on the database backup chain, and the "checksum" is over the stored text
    plus the data URI, not over independently verifiable file bytes.
-7. **Row-Level Security is still not implemented.** The blocker is gone — `scripts/roles.sql` now
-   yields a role measured as `superuser=false`, `bypassrls=false`, and the full suite passes through
-   it (`docs/DATA-MODEL-JURISDICTION.md` §3.2) — but the shipped compose stack still connects as the
-   PostGIS image's superuser `POSTGRES_USER`, and no policies exist. Until both change, application
-   authorization is the only layer.
+7. **Row-Level Security is still not implemented — but the role obstacle is gone.** As of
+   2026-10-19 the shipped compose stack connects as the least-privilege `dharohar_app`
+   (`superuser=false`, `bypassrls=false`, DDL/TRUNCATE/DELETE/audit-UPDATE/ledger-INSERT refused by
+   PostgreSQL itself — see `scripts/probe-role.mjs`), and the schema-owner credential is held only by
+   the one-shot `migrate`/`roleinit`/`maint` services. What is missing is the policy and the
+   per-transaction GUC, and the thing blocking *that* is a decision: `organizations` is empty and
+   `districts` is a global registry, so a tenant-scoped policy has nothing in the schema to enforce.
+   `docs/DATA-MODEL-JURISDICTION.md` §3.2 states the order of work; draft migration 0004 refuses to
+   guess the tenancy and aborts. Until policies exist, application authorization is the only layer.
+7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every one
+   of the 33 `land_documents` rows has an empty `image_uri` — OCR text and metadata, no source bytes.
+   Nothing is broken in the storage path (a 1.5 MB payload written through the API round-tripped
+   through backup and restore with an identical digest), but a record set without its source images is
+   not digitized land records, and any "documents are preserved" statement about the current data is
+   false by vacuity. This is an operational gap in how the demo data was created, not a defect — and
+   it must be closed with real uploads before the first pilot, because the audit trail of a seal over
+   an absent image is unverifiable.
+7c. **Production UI now fails closed when the API is unavailable.** Measured with the API stopped and
+   the built bundle served by nginx: sign-in is refused, the session flag stays false, and a
+   persistent `role=status` panel says the server is unreachable rather than letting the officer
+   discover it later. Previously a connection refusal authenticated into a *demo* workstation whose
+   seals and edits were saved to nothing, and the only evidence was a toast that expired in six
+   seconds — which itself was invisible, because the notification stack was mounted only inside the
+   authenticated layout. `import.meta.env.PROD` is what separates that behaviour from `npm run dev`,
+   which keeps the offline demo session deliberately.
 8. **Districts are referenced by a stable key now; the registry itself has no authoritative rows.**
    Migration 0003 added `district_code` to `parcels`, `land_documents`, `users` and
    `user_jurisdictions`, with foreign keys to `districts(code)`, CHECKs so the text and the key cannot

@@ -114,8 +114,12 @@ export async function fetchBackendHealth(): Promise<BackendHealthInfo> {
       lastSync: new Date().toISOString(),
     };
   } catch {
+    // This branch used to report 'dev-fallback', which is the value the store also uses for "no
+    // probe has run yet" — so an outage was indistinguishable from a development server and the UI
+    // had no way to say "the API is down". 'dev-fallback' now means only what it says: the backend
+    // answered, and it is running without a database.
     return {
-      status: 'dev-fallback',
+      status: 'disconnected',
       storageMode: 'dev-fallback',
       postgisAvailable: false,
       lastSync: new Date().toISOString(),

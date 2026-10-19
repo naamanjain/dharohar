@@ -1,9 +1,9 @@
 # DHAROHAR — production stack for a small free-tier VM (1 vCPU / 2GB RAM class).
 #
-# Usage:
-#   1. Copy .env.example values into your shell or an UNTRACKED .env next to this file.
-#   2. Set the three required variables below (compose refuses to start without them).
-#   3. docker compose -f docker-compose.prod.yml up -d --build
+# Usage (first time, after writing the untracked .env described below):
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Compose then runs, in order: db -> migrate (DDL, as the schema owner) -> roleinit (grants the API
+# role, as the owner) -> api (as the least-privilege role) -> web.
 #
 # NO credentials are hardcoded anywhere; nothing here should ever be committed with
 # real secret values.
@@ -11,9 +11,17 @@ name: dharohar-prod
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REQUIRED OPERATOR INPUT — placeholder mechanism, intentionally fails closed:
-#   POSTGRES_PASSWORD  : set it yourself, e.g. `openssl rand -hex 24`. There is NO
-#                        default value; compose aborts with the message below if it
-#                        is missing. Same for JWT_SECRET.
+#   POSTGRES_PASSWORD     : the SCHEMA OWNER / maintenance identity. Used by `db` to initialize,
+#                           and by `migrate` and `roleinit` to run DDL and grant privileges. The API
+#                           never sees it. Generate with `openssl rand -hex 24`.
+#   DHAROHAR_APP_PASSWORD : the RUNTIME identity's password (role dharohar_app: no superuser, no
+#                           DDL, append-only audit). Generate with `openssl rand -base64 32`.
+#   JWT_SECRET            : token signing secret.
+# Each is `${VAR:?...}`, so an unset value aborts the command instead of substituting a default.
+#
+# TWO DATABASE IDENTITIES ON PURPOSE. The runtime role cannot write schema_migrations (roles.sql
+# section 5 grants it SELECT only), so it cannot apply a migration even if someone flips
+# RUN_MIGRATIONS=true; DDL belongs to the owner, and the owner is not reachable from the API.
 # ──────────────────────────────────────────────────────────────────────────────
 
 x-db-credentials: &db-credentials
@@ -21,6 +29,15 @@ x-db-credentials: &db-credentials
   POSTGRES_DB: ${POSTGRES_DB:-dharohar}
   # The :? operator makes an unset/empty value a hard error — no silent default password.
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - generate one with 'openssl rand -hex 24' and export it or put it in an untracked .env file}
+
+# Owner connection string, used ONLY by the one-shot maintenance services.
+x-owner-url: &owner-url postgresql://${POSTGRES_USER:-dharohar}:${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}@db:5432/${POSTGRES_DB:-dharohar}
+
+# Runtime connection string: the least-privilege role. Nothing in this file gives the API the owner
+# password, so a compromised API cannot alter schema, drop a table or rewrite the audit chain.
+x-app-credentials: &app-credentials
+  PGUSER: ${DHAROHAR_APP_USER:-dharohar_app}
+  PGPASSWORD: ${DHAROHAR_APP_PASSWORD:?DHAROHAR_APP_PASSWORD is not set - generate one with 'openssl rand -base64 32'; this is the password of the least-privilege role dharohar_app that scripts/roles.sql creates}
 
 services:
   db:
@@ -44,6 +61,78 @@ services:
           cpus: "0.75"
           memory: 512M
 
+  # ────────────────────────────────────────────────────────────────────────────
+  # ONE-SHOT MAINTENANCE SERVICES (schema owner). These are the only containers that
+  # ever hold the owner password, and neither stays running.
+  # ────────────────────────────────────────────────────────────────────────────
+
+  # Applies pending versioned migrations. Forward-only, additive, checksummed; a no-op when current.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: "no"
+    entrypoint: ["node", "dist-server/db/migrate.js"]
+    environment:
+      NODE_ENV: production
+      PGHOST: db
+      PGPORT: 5432
+      <<: *db-credentials
+      DATABASE_URL: *owner-url
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+
+  # Creates/refreshes the least-privilege runtime role and its grants. Idempotent: re-running it
+  # re-asserts the lockdown attributes and sets the password from DHAROHAR_APP_PASSWORD, so rotating
+  # that value and running `up` again is the documented rotation path.
+  #
+  # The single-quoted command is passed to the container verbatim: compose does not interpolate it, so
+  # the password never appears in a connection string baked into the file, and psql takes its target
+  # from PG* in the environment. The value is visible only inside this short-lived container.
+  roleinit:
+    image: postgis/postgis:16-3.4-alpine
+    restart: "no"
+    entrypoint: ["sh", "-c", 'exec psql --no-psqlrc -q -v ON_ERROR_STOP=1 -v app_password="$DHAROHAR_APP_PASSWORD" -f /roles.sql']
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-dharohar}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}
+      PGDATABASE: ${POSTGRES_DB:-dharohar}
+      DHAROHAR_APP_PASSWORD: ${DHAROHAR_APP_PASSWORD:?see DHAROHAR_APP_PASSWORD note above}
+    volumes:
+      - ./scripts/roles.sql:/roles.sql:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+
+  # Ad-hoc owner-role work for an operator: seed, bootstrap-admin, integrity checker, restore.
+  # Excluded from `up` by the profile; started with `docker compose run --rm maint <script>`.
+  # The entrypoint is bare `node` so the arguments you pass are the script to run:
+  #   docker compose -f docker-compose.prod.yml --profile tools run --rm maint dist-server/db/seed.js
+  maint:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["node"]
+    environment:
+      NODE_ENV: production
+      PGHOST: db
+      PGPORT: 5432
+      <<: *db-credentials
+      DATABASE_URL: *owner-url
+      DEMO_PASSWORD: ${DEMO_PASSWORD:?DEMO_PASSWORD is not set - the seed needs it to set the demo persona password}
+      SEED_CONFIRM: ${SEED_CONFIRM:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+
   api:
     build:
       context: .
@@ -64,13 +153,17 @@ services:
       TRUST_PROXY: "true"
       PGHOST: db
       PGPORT: 5432
-      PGUSER: ${POSTGRES_USER:-dharohar}
-      PGPASSWORD: ${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}
+      # THE RUNTIME IDENTITY IS NOT THE SCHEMA OWNER. dharohar_app has SELECT/INSERT/UPDATE on the
+      # operational tables and nothing else: no CREATE, no TRUNCATE, no DELETE except parcel_owners,
+      # INSERT-only on the audit chain, SELECT-only on schema_migrations. Verified by scripts/roles.sql
+      # section 9 against pg_roles and has_*_privilege(), not assumed.
+      <<: *app-credentials
       PGDATABASE: ${POSTGRES_DB:-dharohar}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-dharohar}:${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}@db:5432/${POSTGRES_DB:-dharohar}
-      # Apply pending versioned migrations from dist-server/db/migrations on boot (entrypoint flag).
-      # Forward-only and additive; it never seeds or resets. Seeding is a separate, explicit step.
-      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      DATABASE_URL: postgresql://${DHAROHAR_APP_USER:-dharohar_app}:${DHAROHAR_APP_PASSWORD:?see DHAROHAR_APP_PASSWORD note above}@db:5432/${POSTGRES_DB:-dharohar}
+      # Migrations are the `migrate` service's job (owner identity). Kept switchable but off by
+      # default: with SELECT-only on schema_migrations the API could not record a migration anyway,
+      # so enabling this now would fail half-applied rather than succeed.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
     healthcheck:
       # /api/health/ready actively pings the DB and returns 503 when unreachable.
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -81,6 +174,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      roleinit:
+        condition: service_completed_successfully
     volumes:
       # Uploads/artefact scratch space. The current API stores document bytes in the
       # database, but this named volume guarantees any on-disk artefacts survive

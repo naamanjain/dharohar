@@ -1,7 +1,6 @@
 import React from 'react';
 import { Header } from './Header';
 import { Sidebar } from './Sidebar';
-import { NotificationToast } from '../common/NotificationToast';
 import { ShieldCheck } from 'lucide-react';
 import { useTranslation } from '../../i18n';
 
@@ -35,7 +34,7 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
           <div className="max-w-7xl mx-auto">{children}</div>
         </main>
       </div>
-      <NotificationToast />
+      {/* NotificationToast moved to App.tsx so it also renders on the login screen. */}
     </div>
   );
 };

@@ -321,6 +321,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       // server the persona picker is a demo, and the session has to say so instead of pretending.
       const unreachable = err instanceof ApiError && err.status === 0;
       if (unreachable) {
+        // A shipped production bundle must not sign anyone into a workstation it cannot persist to.
+        // The local-only session below is the development convenience that makes the prototype
+        // demonstrable without a backend; left available in production it lets an officer seal, edit
+        // and certify records that exist only in that browser tab, with a header banner as the only
+        // evidence. The banner is honest but it is not a barrier, and a barrier is what an unavailable
+        // dependency needs. `npm run dev` keeps the demo session.
+        if (import.meta.env.PROD) {
+          setBackendSession('failed');
+          // Refresh the probe so the persistent banner reflects this attempt rather than whatever
+          // the mount-time probe saw: if the server came back, the warning must go away on the next
+          // try, and if it went away, the warning has to appear now.
+          void checkBackendStatus();
+          addNotification(
+            systemLanguage === 'hi' ? 'सर्वर अनुपलब्ध' : 'Server unavailable',
+            systemLanguage === 'hi'
+              ? 'API सर्वर से संपर्क नहीं हो सका। कोई भी रिकॉर्ड सहेजा नहीं जाएगा, इसलिए साइन इन नहीं किया गया है।'
+              : 'The API server could not be reached, so you are not signed in. Nothing can be read or saved until it is back.',
+            'error'
+          );
+          return;
+        }
+
         setCurrentUser({ ...user, role: undefined });
         setBackendSession('demo');
         setIsAuthenticated(true);
@@ -331,6 +353,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             ? 'सर्वर उपलब्ध नहीं: यह सत्र केवल स्थानीय है और कोई अभिलेख सहेजा नहीं जाएगा।'
             : 'API server unreachable — this session is local only. Nothing you seal or save will persist.',
           'warning'
+        );
+        return;
+      }
+
+      // 502/504 from the proxy is the same fact as a refused socket: the backend is not there. It
+      // arrives as a numbered status rather than 0, so it has to be recognised or an outage is
+      // reported to the officer as a wrong password.
+      const outage = err instanceof ApiError && (err.status === 502 || err.status === 503 || err.status === 504);
+      if (outage) {
+        setBackendSession('failed');
+        void checkBackendStatus();
+        addNotification(
+          systemLanguage === 'hi' ? 'सर्वर अनुपलब्ध' : 'Server unavailable',
+          systemLanguage === 'hi'
+            ? `API सर्वर ने HTTP ${err.status} दिया — वह अभी सेवा नहीं दे रहा।`
+            : `The API answered HTTP ${err.status} — it is not serving requests right now. You are not signed in.`,
+          'error'
         );
         return;
       }

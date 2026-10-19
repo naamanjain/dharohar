@@ -231,23 +231,49 @@ the primary one — not as a substitute for it.
 policy would currently do nothing at all. Three independent reasons, all true today:
 
 ```
+-- measured 2026-10-17 against the owner identity, which is why RLS would have done nothing:
 current_user      = dharohar            -- also the OWNER of `parcels`
 rolsuper          = true                -- the postgis/postgis image makes POSTGRES_USER a superuser
 rolbypassrls      = true
 relrowsecurity / relforcerowsecurity = f / f
+
+-- measured 2026-10-19 against the shipped runtime identity (scripts/probe-role.mjs):
+current_user      = dharohar_app        -- owns nothing in the database
+rolsuper          = false
+rolbypassrls      = false
+DDL / TRUNCATE / DELETE / audit-UPDATE / ledger-INSERT / CREATE ROLE  -> all 42501 permission denied
 ```
 
 A superuser, a `BYPASSRLS` role, and a table owner each skip row security; `FORCE ROW LEVEL
-SECURITY` only helps for the owner case. So RLS requires the API to connect as the
-**least-privilege role created by `scripts/roles.sql`**, with the schema owned by a different role —
-a deployment change, not a migration alone. Until that switch happens, adding policies would produce
-the worst kind of false assurance: a checkbox in the docs and zero enforcement in the database.
+SECURITY` only helps for the owner case. The first two no longer apply to the API and the third never
+did — so policies would now be enforced rather than decorative. That is the whole reason the role
+switch was done before writing them.
 
 Order of work, if you want layer 2: (1) apply `scripts/roles.sql` and point `PGUSER`/`DATABASE_URL` at
-the app role, confirming `rolsuper=false, rolbypassrls=false`; (2) add the policies in migration
-`0002` with `FORCE ROW LEVEL SECURITY` where the API is also the owner; (3) set the GUC in every
-transaction site; (4) extend `npm run test:jurisdiction` so a policy violation fails the build.
-Steps (1)–(4) are each independently shippable; skipping (1) makes (2) decorative.
+the app role, confirming `rolsuper=false, rolbypassrls=false` — **done, and the default since
+2026-10-19**; (2) write the policies and `ENABLE ROW LEVEL SECURITY` (+ `FORCE` where the API is also
+the owner, which it is not); (3) set the GUC in every transaction site; (4) extend
+`npm run test:jurisdiction` so a policy violation fails the build.
+
+**What still blocks step (2), and it is not technical.** A policy needs to express "this row belongs
+to a district this officer holds" — and, for a tenant-aware deployment, "…inside the same
+organization". Two prerequisites are unmet:
+
+* `organizations` has no rows on any deployment, and `districts.organization_id` is NULL everywhere,
+  so an organization-scoped policy has nothing to match on. Draft migration
+  `server/src/db-draft/0004_org_scoped_district_registry.sql` is written for this and deliberately
+  refuses to run against that state: with no tenants recorded it aborts with `[TENANCY_UNDECISIONED]`,
+  and with some districts attributed and some not it aborts with `[TENANCY_AMBIGUOUS]` and names the
+  unattributed codes. Both refusals were executed against a seeded scratch database, and because the
+  file runs inside one transaction, the abort left no `districts.id` column behind — "nothing was
+  changed" is literally true rather than a reassurance.
+* The district registry is still **global**: `code` is the primary key and
+  `ux_districts_canonical_name` makes a name unique across every organization. Until that is
+  org-scoped, "cross-tenant" isolation has no meaning in the schema, and a policy that pretended
+  otherwise would be enforcing a distinction the data cannot represent.
+
+So the honest status is: the role barrier that made RLS impossible is gone, the policy itself is
+unwritten, and the first line of policy work is a decision about tenancy — not a `CREATE POLICY`.
 
 **Step (1) was carried out and measured on 2026-10-17, so the blocker is now a configuration switch
 rather than an unknown.** `scripts/roles.sql` was extended to cover the migration-0002 tables
@@ -347,16 +373,23 @@ Do **not** expose real land-record data publicly until all of these are true:
    assignment over both districts, records the reason in `parcel_mutations` and its own
    `PARCEL_REDISTRICTED` audit entry, and leaves earlier entries untouched.
 7. The API connects as a least-privilege database role (§3.2) before RLS is claimed as a control. —
-   **NOT DONE.** The role and its measurements exist; the shipped compose stack still uses the superuser.
+   **DONE on 2026-10-19, and measured, not configured-and-hoped.** `docker-compose.prod.yml` now gives
+   the `api` service `dharohar_app` and nothing else; the schema-owner password is held only by the
+   `migrate`, `roleinit` and `maint` one-shot containers. Verified against the running container:
+   `current_user = dharohar_app`, `superuser=false`, `bypassrls=false`, and eight privilege probes
+   denied by PostgreSQL itself (DDL, TRUNCATE, DELETE on parcels/users/audit, UPDATE on the audit
+   chain, INSERT into `schema_migrations`, CREATE ROLE) while reads and operational writes were
+   allowed. `scripts/probe-role.mjs` reproduces that table on any deployment.
+   RLS is still NOT enabled — see §3.2 for what it now needs, which is a policy and the GUC wiring,
+   not a role.
 8. Jurisdiction references are valid, or explicitly reported as unresolved. — **DONE as of migration
    0003**, with the inspection report, the checker, its negative control and the migration's own refusal
    to guess documented in `docs/DISTRICT-INTEGRITY-REPORT.md`. Outstanding there: the registry still has
    no `declared` rows, so no `[PASS]` proves any district name is the department's — only that the rows
    agree with each other.
-   — **MEASURED, NOT YET THE DEFAULT.** The role exists, is non-superuser and `NOBYPASSRLS`, and the
-   whole suite passes through it; the shipped compose file still uses the container's
-   `POSTGRES_USER`, which is a superuser. Switching it is a deployment step, and until it happens no
-   row-level-security claim is true.
+   — **THE DEFAULT SINCE 2026-10-19.** The shipped compose file gives the API `dharohar_app`, and the
+   authorization suites run through it against the live stack. What is left for layer 2 is the policy
+   and the per-transaction GUC, plus the tenancy decision above — not the role.
 
 Until 5, 6 and 7 are closed, this deployment is a **demo instance with fabricated records only**, and
 the demo personas, demo parcels and `SEED_CONFIRM=demo` guard all reflect that.

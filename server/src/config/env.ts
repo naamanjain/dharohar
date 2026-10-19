@@ -52,7 +52,28 @@ function resolveJwtSecret(): string {
   return crypto.randomBytes(32).toString('hex');
 }
 
-export const JWT_SECRET = resolveJwtSecret();
+/**
+ * Resolved on first use, not at import.
+ *
+ * This used to be `export const JWT_SECRET = resolveJwtSecret()`, which threw during module load in
+ * production. Any script that imported anything reaching this file — including the migration runner,
+ * which needs no signing key at all — died with "JWT_SECRET is not set". That forced the maintenance
+ * containers to carry the API's signing secret, which is exactly the coupling Phase "separate
+ * migrations from the runtime" is meant to remove. The guarantee is unchanged: the HTTP server calls
+ * assertProductionSecrets() before it binds a port, so production still refuses to start without a
+ * unique secret — it just refuses at the component that uses it.
+ */
+let resolvedJwtSecret: string | null = null;
+
+export function signingSecret(): string {
+  if (resolvedJwtSecret === null) resolvedJwtSecret = resolveJwtSecret();
+  return resolvedJwtSecret;
+}
+
+/** Fail fast, in the process that actually signs tokens. */
+export function assertProductionSecrets(): void {
+  signingSecret();
+}
 
 /**
  * The password the four demo personas are seeded with.
@@ -72,8 +93,12 @@ export const DEMO_PASSWORD: string =
 /**
  * Seal signatures must not be reproducible from anything a reader of the audit log can
  * see, so they get their own HMAC key rather than the plain SHA-256 the prototype used.
+ * Lazy for the same reason as signingSecret(): falling back to the JWT secret at import
+ * meant a module that never signs a seal still forced the secret to be resolved.
  */
-export const SEAL_SIGNING_KEY = (process.env.SEAL_SIGNING_KEY || '').trim() || JWT_SECRET;
+export function sealSigningKey(): string {
+  return (process.env.SEAL_SIGNING_KEY || '').trim() || signingSecret();
+}
 
 export const JWT_EXPIRY_HOURS = Number(process.env.JWT_EXPIRY_HOURS) || 24;
 

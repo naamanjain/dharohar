@@ -6,7 +6,7 @@ import { useTranslation } from '../../i18n';
 import { Shield, User, KeyRound, CheckCircle, ArrowRight, AlertTriangle, ShieldCheck } from 'lucide-react';
 
 export const LoginView: React.FC = () => {
-  const { login, systemLanguage, toggleLanguage } = useApp();
+  const { login, systemLanguage, toggleLanguage, addNotification, backendHealth } = useApp();
   const { t, isHindi } = useTranslation();
   const [selectedProfile, setSelectedProfile] = useState<UserProfile>(USER_PROFILES[0]);
   const [password, setPassword] = useState<string>('');
@@ -16,7 +16,16 @@ export const LoginView: React.FC = () => {
   const handleLoginSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (captchaInput.trim().toUpperCase() !== captchaCode.toUpperCase()) {
+      // The code is regenerated on a mismatch, which without a message reads as a dead button: the
+      // screen changes under the user's hands and nothing explains why the click did nothing.
       setCaptchaCode(Math.random().toString(36).slice(2, 7).toUpperCase());
+      addNotification(
+        isHindi ? 'सुरक्षा कोड मेल नहीं खाया' : 'Security code did not match',
+        isHindi
+          ? 'नया सुरक्षा कोड बनाया गया है — कृपया वह कोड दर्ज करें जो अब दिखाई दे रहा है।'
+          : 'A new security code has been generated. Type the code now shown and try again — nothing was submitted.',
+        'error'
+      );
       return;
     }
     login(selectedProfile, password);
@@ -97,6 +106,22 @@ export const LoginView: React.FC = () => {
         {/* Right Side: Login Form with Quick Presets */}
         <div className="md:col-span-7 p-6 sm:p-8 bg-white flex flex-col justify-between">
           <div>
+            {backendHealth.status === 'disconnected' && (
+              // A toast dismisses itself after six seconds; an outage does not. This panel stays for
+              // as long as the probe keeps failing, so nobody reads a dead-looking form as their own
+              // mistake, and nobody signs in believing records are being saved when they are not.
+              <div
+                role="status"
+                className="mb-4 p-3 rounded-lg border border-red-300 bg-red-50 text-red-800 text-[11px] leading-snug"
+              >
+                <span className="font-semibold block mb-1">
+                  {isHindi ? 'सर्वर से संपर्क नहीं हो सका' : 'Cannot reach the server'}
+                </span>
+                {isHindi
+                  ? 'API उत्तर नहीं दे रहा। जब तक यह चेतावनी दिख रही है, साइन इन अस्वीकार रहेगा और कोई रिकॉर्ड सहेजा नहीं जाएगा।'
+                  : 'The API is not answering. While this warning is showing, sign-in will be refused and no record can be read or saved. Tell the system administrator — this is a server problem, not a wrong password.'}
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-slate-900">{t.login.officerLoginTitle}</h3>
               <span className="text-xs font-mono text-slate-500">Demo Login #01</span>
@@ -168,8 +193,8 @@ export const LoginView: React.FC = () => {
                 </div>
                 <p className="mt-1 text-[10px] leading-snug text-slate-500">
                   {isHindi
-                    ? 'डेमो खातों का पासवर्ड README में है। सर्वर बंद हो तो यह केवल डेमो सत्र रहेगा।'
-                    : 'Demo account passwords are listed in the README. If the API server is down this stays a demo session only.'}
+                    ? 'पासवर्ड प्रशासक द्वारा दिए जाते हैं — यह प्रणाली कहीं भी डिफ़ॉल्ट पासवर्ड प्रकाशित नहीं करती। API सर्वर उपलब्ध न हो तो साइन इन अस्वीकार कर दिया जाएगा।'
+                    : 'Passwords are issued by your administrator; nothing in this system publishes a default one. If the API server cannot be reached, sign-in is refused rather than continuing without it.'}
                 </p>
               </div>
 

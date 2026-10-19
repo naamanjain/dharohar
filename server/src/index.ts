@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { ALLOWED_ORIGINS, IS_PRODUCTION, PORT, TRUST_PROXY } from './config/env';
+import { ALLOWED_ORIGINS, assertProductionSecrets, IS_PRODUCTION, PORT, TRUST_PROXY } from './config/env';
 import { initDbConnection, getDbHealth, pool } from './db/db';
 import { healthRouter } from './routes/health';
 import { authRouter } from './routes/auth';
@@ -91,6 +91,11 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
 
 // Startup lifecycle
 async function startServer() {
+  // Resolved here rather than at import: this process signs tokens, so a missing or leaked
+  // JWT_SECRET must stop it before it accepts a request — but a migration runner that never signs
+  // anything has no reason to die on it.
+  assertProductionSecrets();
+
   console.log('==================================================');
   console.log('  DHAROHAR Land Record Digitization Server       ');
   console.log('  Phase 4: Authoritative Backend + Security Engine ');

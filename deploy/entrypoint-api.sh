@@ -2,7 +2,8 @@
 # DHAROHAR API container entrypoint.
 # 1. Optionally waits for PostgreSQL (the app itself REFUSES to boot in production
 #    when the DB is unreachable — that behaviour is intentional and not weakened here).
-# 2. Optionally applies schema migrations before serving traffic.
+# 2. Optionally applies schema migrations (OFF by default — see RUN_MIGRATIONS below, the runtime
+#    role is not allowed to write the migration ledger).
 # 3. Execs the CMD (compiled server).
 set -e
 
@@ -34,8 +35,14 @@ if [ "${WAIT_FOR_DB:-true}" = "true" ]; then
   fi
 fi
 
-if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then
-  echo "[entrypoint] applying database migrations..."
+# Migrations are OFF by default: the API connects as the least-privilege role, which holds SELECT
+# only on schema_migrations, so it can read the schema version but can never mark a migration
+# applied. Running DDL from here would apply a migration and then fail to record it — a half-applied
+# change with no ledger entry, which is worse than not running it. Apply migrations with the owner
+# identity instead:  docker compose -f docker-compose.prod.yml run --rm migrate
+if [ "${RUN_MIGRATIONS:-false}" = "true" ]; then
+  echo "[entrypoint] RUN_MIGRATIONS=true - applying database migrations as the runtime role." >&2
+  echo "[entrypoint] this is only valid when this process connects as the schema owner." >&2
   node dist-server/db/migrate.js
 fi
 

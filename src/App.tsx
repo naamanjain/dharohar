@@ -16,6 +16,7 @@ import { BulkProcessingView } from './components/views/BulkProcessingView';
 import { DigitizationReportsView } from './components/views/DigitizationReportsView';
 import { SpatialRegistryView } from './components/views/SpatialRegistryView';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { NotificationToast } from './components/common/NotificationToast';
 
 const MainContent: React.FC = () => {
   const { isLoggedIn, activeView } = useApp();
@@ -65,6 +66,11 @@ export default function App() {
   return (
     <AppProvider>
       <MainContent />
+      {/* Mounted above the view switch, not inside AppLayout: a refused login, a mismatched security
+          code and an unreachable server all raise notifications while the officer is on the login
+          screen, and rendering the stack only for the authenticated shell made every one of them
+          invisible — the button looked dead. */}
+      <NotificationToast />
     </AppProvider>
   );
 }
