@@ -77,6 +77,25 @@ async function bootstrap() {
     organizationId = inserted.rows[0].id;
   }
 
+  // Or attach the administrator to a tenant that already exists — which is how a deployed database
+  // with ORG-DHAROHAR-DEMO in it bootstraps a further administrator. Validated here rather than left
+  // to the foreign key, because an id that does not exist should be named as the flag that produced
+  // it, not reported as an insert failure.
+  const existingOrganization = String(process.env.BOOTSTRAP_ORG_ID ?? '').trim();
+  if (existingOrganization) {
+    if (organizationId) {
+      console.error('[BOOTSTRAP] BOOTSTRAP_ORG_NAME and BOOTSTRAP_ORG_ID are mutually exclusive. Nothing was created.');
+      process.exit(2);
+    }
+    const found = await pool.query('SELECT id FROM organizations WHERE id = $1', [existingOrganization]);
+    if (found.rows.length === 0) {
+      console.error(`[BOOTSTRAP] organization "${existingOrganization}" does not exist. Nothing was created.`);
+      console.error('[BOOTSTRAP] Create the tenant first (organizations table), or omit BOOTSTRAP_ORG_ID to leave the administrator unowned.');
+      process.exit(2);
+    }
+    organizationId = found.rows[0].id;
+  }
+
   // There is no logged-in officer yet, so the trail attributes the grant to the bootstrap command
   // itself rather than inventing a person.
   const bootstrapActor: RequestPrincipal = {
@@ -89,6 +108,10 @@ async function bootstrap() {
     organizationId,
     districts: [district],
     capabilities: ['USER_ADMIN'],
+    // No district grants: this is an account-provisioning identity, not a records identity. It can
+    // create the first officers; it cannot read a parcel until its organization is granted a district
+    // through organization_districts, which is a decision rather than a default.
+    organizationGrants: [],
     primaryDistrict: district,
   };
 
@@ -105,7 +128,8 @@ async function bootstrap() {
       capabilities: ['USER_ADMIN'],
       password,
       state: String(process.env.BOOTSTRAP_ADMIN_STATE ?? 'Rajasthan').trim(),
-      organizationId,
+      // No organizationId here: createOfficer takes the tenant from the actor, and the actor above is
+      // this command, whose organizationId is the one BOOTSTRAP_ORG_NAME/BOOTSTRAP_ORG_ID resolved to.
     },
     bootstrapActor
   );

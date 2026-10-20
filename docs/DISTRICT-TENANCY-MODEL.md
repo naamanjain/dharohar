@@ -369,7 +369,106 @@ correct outcome for a stack whose administrator password the operator has not su
 `districts.kind` defaults to `'canonical'`. Every suite run therefore mints a probe district that
 arrives as canonical geography — that is how `probe 790279` got there. `validate-stack.sh` now
 re-applies the owner's existing retirement decision at the end of each run (T13b) so the gate stays
-repeatable; changing the **default** so that a declaration is not automatically canonical geography is
-a governance decision and is listed in §8 rather than made here.
+repeatable; changing the **default** so that a declaration is not automatically canonical geography was
+listed in §8 as a governance decision, and the owner authorised it on 2026-10-21: migration 0007 makes
+that change, described in §12 below.
+
+## 11. Record ownership versus district jurisdiction — the contract as implemented
+
+Two different questions, two different tables, applied independently. Conflating them is the defect this
+section exists to prevent: `organization_districts` answers *where may this tenant work*, and nothing
+else. It has never answered *whose record is this*, and no code path treats it as if it did.
+
+| | Record ownership | District jurisdiction |
+| --- | --- | --- |
+| Question | Which organization is responsible for this record? | Which districts may this tenant work in, and how? |
+| Lives in | `parcels.organization_id`, `land_documents.organization_id`, `users.organization_id` | `organization_districts` (`administers` \| `audits` \| `reads`), plus the officer's own `user_jurisdictions` |
+| Written by | migration 0006 (stated basis only), the API on create (from the server-side principal), `server/src/db/assignOwnership.ts` (owner-side disposition) | the registry declaration (grants the declaring tenant), a governance decision, or an administrator |
+| Refuses | a value with no `organization_granted_by` / `organization_grant_reason` (CHECK constraints, 0006) | an unknown relationship kind (`INVALID_RELATIONSHIP`) |
+| Revocation | re-stamping an owner is an owner-side act, always attributed | `revoked_at`, read live on every request — effective on the next request, not at token expiry |
+
+**The access rule, in both layers.** A record is reachable when BOTH hold:
+`record.organization_id = caller.organization_id` **and** the record's district is in
+`caller.user_jurisdictions ∩ caller_organization's grants` (reads also accept `audits` and `reads`;
+writes require `administers`). `STATE_WIDE_READ` removes the second condition's dependence on the
+officer's own postings — it is a statement about districts inside one tenant, and it never widens
+tenancy.
+
+**Fail-closed cases, each with its own answer.**
+
+| Condition | Result |
+| --- | --- |
+| Caller has no organization | `403 TENANT_CONTEXT_MISSING`, explained. Not a silent empty list: an operator has to be able to see that the account is unassigned. |
+| Record has no owner (quarantine) | `404`, byte-identical to "does not exist". Unowned rows are preserved and remain reachable only through owner-side tooling. |
+| Record owned by another tenant | `404`, same bytes — a distinct 403 would let anyone enumerate other tenants' ids. |
+| Officer posted to a district the tenant is not granted | `404` (the intersection is empty). A personal posting is not a tenant authority. |
+| Session carries an organization but no matching user | zero rows: the row-level policy requires both halves to agree. |
+| No tenant context bound at all | zero rows, from PostgreSQL rather than from application code. |
+
+**What quarantine is not.** It is not deletion, not a placeholder tenant, and not an inference. 0006
+assigned owners only where a basis is stated in the migration text and aborts if a second organization
+exists; the parcels under retired test fixtures were left unowned because the owner's decision of
+2026-10-19 says that history stays isolated. `server/src/db/assignOwnership.ts` is the only way out, and
+it requires an organization, a named grantor and a reason, refuses unknown ids before writing anything,
+and refuses to move a record that already has an owner unless `ASSIGN_TAKEOVER=true` is passed
+explicitly.
+
+## 12. Migration 0007 — a declaration is no longer canonical geography
+
+`districts.kind` used to default to `'canonical'`, so every declaration — including the ones the test
+suites mint — arrived as canonical geography. That is how `probe 790279` entered the registry. 0007 adds
+`'candidate'` to the domain, makes it the default, and requires an explicit act to promote:
+
+* `POST /api/admin/districts` creates a **candidate** district and grants the declaring tenant the
+  stated relationship (`administers` by default, validated against `audits`/`reads`). The tenant granted
+  is the actor's own, never a body field.
+* `POST /api/admin/districts/:code/promote` is the only path to `canonical`. It requires `USER_ADMIN`, a
+  reason of at least 10 characters, and writes an audit entry. It refuses rows that are
+  `retired`/`test_fixture` — retiring was itself a decision, and an endpoint that could promote test
+  residue back into geography would undo it with a plausible reason attached.
+* The four synthetic canonical districts keep `state_code = 'RJ'`; nothing in 0007 touches existing
+  rows. `validate-stack.sh` asserts that the counts of canonical and retired rows are unchanged by the
+  migration.
 
 
+
+
+## 13. What was executed on 2026-10-21 (migrations 0006–0008, and the tests that forced the fixes)
+
+Applied to the demo deployment; ledger is now `0001…0008`.
+
+| Check | Measured |
+| --- | --- |
+| `./scripts/test-tenant-migration.sh` | **117 assertions passed, 0 failed** — 0006/0007/0008 apply, idempotence, rollback, rollback *guards* (broken on purpose first), quarantine premise, ambiguous-tenant abort, requirement-ordering abort |
+| `./scripts/test-authorization-on-copy.sh` | jurisdiction **46/0**, provisioning **91/0**, tenancy **42/0**; API confirmed running as `dharohar_app`; unbound read as that role returns **0 rows** |
+| `./scripts/validate-stack.sh` | **66 passed, 1 failed** — the failure is `ADMIN_PASSWORD not exported`, i.e. provisioning was not run against the live stack; it ran green against the copy |
+| `npm test` / `npm run lint` | exit 0 — phase 4 47/0, E2E 53/0, tsc clean |
+| Ownership after 0006, measured at the end of this phase | 29 parcels + 41 documents + 59 officers owned by `ORG-DHAROHAR-DEMO`; **12 parcels and 2 documents quarantined** — every one of them a retired test fixture or a row with neither a district nor a parcel. Counts move between runs because the gate itself creates synthetic records. |
+| `./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups` | all checks passed: a 2,000,000-byte payload hashes identically after dump → second volume → restore; the audit chain (2,164 entries, 167 carrying an actor organization since 0008) hashes to the same value on both sides |
+
+Things this phase found by running, not by reading:
+
+1. **`dharohar_app` had no SELECT on `organization_districts`.** The tenant grants are read on every
+   authenticated request, so every request failed closed with `AUTHORIZATION_UNAVAILABLE` — 46 checks in
+   an unrelated suite went red before the cause was named. `scripts/roles.sql` predates migration 0004's
+   tables and simply did not list them.
+2. **`parcelScopeClause` emitted a placeholder it never supplied.** A state-wide reader contributes no
+   district parameter, so the organization predicate referenced `$2` with one parameter bound; PostgreSQL
+   refused and the endpoint answered 503 with an empty list. Parameters are now numbered by what is
+   actually emitted.
+3. **Attributing an audit entry by badge or display name is not attribution.** The bootstrapped
+   administrator's officer row has `badge_number = NULL` while its entries carry `BOOTSTRAP`, so three
+   freshly written entries looked missing. Migration 0008 stores `actor_user_id` /
+   `actor_organization_id` outside the entry hash — the chain covers
+   `previousHash:entityId:actionType:performedBy:timestamp:detailsHash`, so attribution cannot rewrite
+   history — and the older matchers stay as fallbacks so pre-0008 entries are never hidden.
+4. **The integrity checker became an RLS casualty.** Run as the runtime role it "found" 41 orphaned owner
+   rows that exist perfectly well; it just could not see the parcels. It now refuses that identity and
+   prints which identity it ran as; the documented invocation moved to the `maint` one-shot. A diagnostic
+   that cannot tell *absent* from *hidden from me* is worse than none, because someone signs off on it.
+5. **`maint` is its own image.** `--profile tools build migrate api` left `assignOwnership.js` out of the
+   `maint` bundle; the module-not-found error looked like a broken script. `--profile tools build` is now
+   the documented form.
+6. Two of my own assertions were wrong while the code was right: a JavaScript `===` between a `bigint`
+   string and a number, and a rollback expectation that compared against the assigned count instead of
+   the whole table.

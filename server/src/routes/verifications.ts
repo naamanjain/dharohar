@@ -61,6 +61,7 @@ verificationsRouter.get('/audit-logs', authenticateToken, async (req: Request, r
   // An administrator sees the account-provisioning trail (which belongs to no district); a district
   // officer does not, and neither case changes what parcels they can reach.
   const logs = await getAuditLogs({
+    principal: req.principal!,
     parcelId,
     entityId,
     districts: parcelId ? null : scope,

@@ -142,7 +142,6 @@ export interface NewOfficer {
   capabilities?: Capability[];
   password: string;
   state?: string;
-  organizationId?: string | null;
 }
 
 /**
@@ -174,6 +173,13 @@ export async function createOfficer(input: NewOfficer, actor: RequestPrincipal):
     );
   }
 
+  // The new account belongs to whoever created it. There is deliberately no organizationId on the
+  // input type: a body field naming a tenant is a claim about who will own the record, and letting it
+  // through would let one organization's administrator plant accounts inside another's.
+  // An actor with no organization produces an unowned account, which migration 0006's CHECK accepts
+  // and which row-level security then refuses to show anyone — that is the bootstrap/platform case,
+  // and it is resolved by the disposition command, not by a guess here.
+  const organizationId = actor.organizationId ?? null;
   const id = String(input.id ?? '').trim() || `USR-${normalise(input.role).slice(0, 3).toUpperCase()}-${Date.now().toString().slice(-6)}`;
   const { hash, salt } = hashPassword(input.password);
   const createdAt = new Date().toISOString();
@@ -188,13 +194,18 @@ export async function createOfficer(input: NewOfficer, actor: RequestPrincipal):
     }
 
     await client.query(
-      `INSERT INTO users (id, email, password_hash, salt, role, display_name, designation, badge_number, jurisdiction, district, state, organization_id, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      `INSERT INTO users (id, email, password_hash, salt, role, display_name, designation, badge_number, jurisdiction, district, state, created_at,
+                          organization_id, organization_granted_by, organization_grant_reason, organization_granted_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())`,
       [
         id, email, hash, salt, input.role, displayName,
         input.designation || input.role, input.badgeNumber || null,
-        districts.join(', '), districts[0] || '', input.state || 'Rajasthan',
-        input.organizationId ?? actor.organizationId ?? null, createdAt,
+        districts.join(', '), districts[0] || '', input.state || 'Rajasthan', createdAt,
+        // Migration 0006 refuses an owner with no attribution, so the grantor and the reason are
+        // written with it or not at all.
+        organizationId,
+        organizationId ? `officer:${actor.email}` : null,
+        organizationId ? `Provisioned through the API by ${actor.displayName} (${actor.badgeNumber}).` : null,
       ]
     );
 
@@ -223,6 +234,7 @@ export async function createOfficer(input: NewOfficer, actor: RequestPrincipal):
         actionType: 'OFFICER_PROVISIONED',
         performedBy: actor.displayName,
         officerBadge: actor.badgeNumber,
+        actor,
         createdAt,
         details: { role: input.role, districts, capabilities, email },
       },
@@ -280,6 +292,7 @@ export async function setOfficerJurisdictions(
         actionType: 'OFFICER_JURISDICTIONS_CHANGED',
         performedBy: actor.displayName,
         officerBadge: actor.badgeNumber,
+        actor,
         details: { added: after.filter((d) => !before.includes(d)), revoked: before.filter((d) => !after.includes(d)), reason: why },
       },
       client
@@ -331,6 +344,7 @@ export async function setOfficerCapabilities(
         actionType: 'OFFICER_CAPABILITIES_CHANGED',
         performedBy: actor.displayName,
         officerBadge: actor.badgeNumber,
+        actor,
         details: { added: after.filter((c) => !before.includes(c)), revoked: before.filter((c) => !after.includes(c)), reason: why },
       },
       client
@@ -375,6 +389,7 @@ export async function setOfficerRole(
         actionType: 'OFFICER_ROLE_CHANGED',
         performedBy: actor.displayName,
         officerBadge: actor.badgeNumber,
+        actor,
         details: { from: before, to: role, reason: why },
       },
       client
@@ -424,6 +439,7 @@ export async function resetOfficerPassword(
         actionType: 'OFFICER_PASSWORD_RESET',
         performedBy: actor.displayName,
         officerBadge: actor.badgeNumber,
+        actor,
         details: { reason: why },
       },
       client
@@ -442,6 +458,10 @@ export async function resetOfficerPassword(
 export async function listOfficers(actingPrincipal: RequestPrincipal): Promise<any[]> {
   requirePostgres();
 
+  // A tenant administrator sees their own accounts plus the unowned ones — the latter are the
+  // disposition queue, not another tenant's roster. An identity with no organization at all sees
+  // every account, which is the platform/bootstrap case and is reachable only by an officer holding
+  // USER_ADMIN whose own row carries no tenant.
   const rows = await pool.query(
     `SELECT u.id, u.email, u.role, u.display_name, u.designation, u.badge_number, u.district, u.state, u.organization_id,
             COALESCE((SELECT json_agg(j.district ORDER BY j.district) FROM user_jurisdictions j WHERE j.user_id = u.id AND j.revoked_at IS NULL), '[]') AS jurisdictions,

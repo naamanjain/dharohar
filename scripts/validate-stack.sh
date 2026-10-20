@@ -93,6 +93,30 @@ chk "no test-suite fixture is presented as canonical geography" "0" "$(q "select
 chk "retired fixtures are refused for new writes (inactive)" "0" "$(q "select count(*) from districts where kind='retired' and is_active")"
 chk "children reference the identifier as well as the code" "4" "$(q "select count(*) from pg_constraint where conname in ('fk_parcels_district_id','fk_land_documents_district_id','fk_users_district_id','fk_user_jurisdictions_district_id')")"
 chk "no record has a district code that the registry cannot answer" "0" "$(q "select (select count(*) from parcels where district_code is not null and district_id is null) + (select count(*) from users where district_code is not null and district_id is null) + (select count(*) from land_documents where district_code is not null and district_id is null) + (select count(*) from user_jurisdictions where district_code is not null and district_id is null)")"
+# Migrations 0006 and 0007 are what make tenancy testable, so the gate asserts their objects and the
+# one property that matters operationally: the runtime role cannot read a record it has no tenant for.
+chk "documents carry an owner column" "1" "$(q "select count(*) from information_schema.columns where table_name='land_documents' and column_name='organization_id'")"
+chk "ownership cannot be claimed without attribution" "3" "$(q "select count(*) from pg_constraint where conname in ('ck_parcels_ownership_is_attributed','ck_land_documents_ownership_is_attributed','ck_users_ownership_is_attributed')")"
+chk "row-level security is enabled on both root record tables" "2" "$(q "select count(*) from pg_class where relname in ('parcels','land_documents') and relrowsecurity")"
+chk "four tenant policies per root table" "8" "$(q "select count(*) from pg_policies where tablename in ('parcels','land_documents') and policyname like 'tenant_%'")"
+APP_BARE_ROWS="$(docker compose -f docker-compose.prod.yml exec -T api node --input-type=module -e "import pg from 'pg'; const c=new pg.Client(); await c.connect(); const r=await c.query('select count(*)::int n from parcels'); console.log(r.rows[0].n); await c.end();" 2>&1 | tail -1)"
+# An unbound query is the shape a forgotten tenant predicate takes. It must return nothing, which is
+# the difference between row-level security as a second layer and row-level security as a claim.
+chk "the runtime role reading parcels with no tenant context gets zero rows" "0" "$APP_BARE_ROWS"
+chk "a declaration no longer defaults to canonical geography" "'candidate'::text" "$(q "select column_default from information_schema.columns where table_name='districts' and column_name='kind'")"
+chk "no second tenant exists yet, so nothing was silently reassigned" "t" "$(q "select (select count(*) from organizations) <= 1")"
+# The checker's own identity guard, exercised both ways. As the runtime role it must REFUSE (a report
+# from an RLS-blind identity would list records it cannot see as missing); as the owner it must run.
+docker compose -f docker-compose.prod.yml exec -T api node dist-server/verify_district_integrity.js > /tmp/integrity-as-app.log 2>&1
+chk "the integrity checker refuses to report as the row-level-security-bound runtime role" "2" "$?"
+grep -qE "refusing to run as" /tmp/integrity-as-app.log && RC=0 || RC=1
+chk "and it says why, naming the identity and the fix" "0" "$RC"
+docker compose -f docker-compose.prod.yml --profile tools run --rm maint dist-server/verify_district_integrity.js > /tmp/integrity-as-owner.log 2>&1
+INTEGRITY_RC=$?
+# exit 1 means "findings exist", which is a valid report on this demo database; 0 means consistent.
+# Anything else (notably 2) would mean it could not see the register at all.
+chk "the checker produces a real report as the schema owner" "1" "$([ $INTEGRITY_RC -le 1 ] && echo 1 || echo 0)"
+chk "the report states which identity ran it" "1" "$(grep -c 'exempt from row-level security' /tmp/integrity-as-owner.log)"
 
 echo "=== seed demo data (explicitly authorised) then T5/T11 persistence across restart ==="
 docker compose -f docker-compose.prod.yml exec -T -e SEED_CONFIRM=demo -e DEMO_PASSWORD="$DEMO_PASSWORD" api node dist-server/db/seed.js >/dev/null 2>&1

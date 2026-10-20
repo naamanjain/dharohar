@@ -8,6 +8,7 @@
 
 import { PoolClient } from 'pg';
 import { pool, getDbHealth, memoryStore } from '../db/db';
+import { beginTenantTransaction } from '../db/tenant';
 import { recordAuditLog } from './auditService';
 import { validateParcel } from './validationService';
 import { generateCertificateNumber, signSeal } from '../utils/crypto';
@@ -75,7 +76,7 @@ export async function sealParcel(options: {
   const notes = options.officerNotes || 'Verified against Master Shajra Cadastre.';
   const sealedAt = new Date().toISOString();
 
-  const valResult = await validateParcel(parcelId, officer.displayName);
+  const valResult = await validateParcel(parcelId, officer, officer.displayName);
   if (!valResult.canBeVerified && !forceOverride) {
     throw new SealRejected(
       'VERIFICATION_PRECONDITIONS_FAILED',
@@ -103,8 +104,7 @@ export async function sealParcel(options: {
   if (health.storageMode === 'postgres-postgis') {
     let client: PoolClient | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(officer);
 
       const current = await client.query(
         'SELECT id, status, verified_at FROM parcels WHERE id = $1 FOR UPDATE',
@@ -258,8 +258,7 @@ export async function recordFieldInspection(options: {
   if (health.storageMode === 'postgres-postgis') {
     let client: PoolClient | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(officer);
 
       const exists = await client.query('SELECT id, status FROM parcels WHERE id = $1 FOR UPDATE', [parcelId]);
       if (exists.rows.length === 0) throw new SealRejected('NOT_FOUND', `Parcel ${parcelId} not found.`);
@@ -421,8 +420,14 @@ export async function linkDocument(options: {
   officerBadge?: string;
   /** Used only when neither the caller nor the parcel carries a district. */
   defaultDistrict?: string;
+  /**
+   * Required. The link writes to two tenant-scoped tables, so it must run in the caller's row-level
+   * security context and stamp the new document with the caller's organization — not with whatever
+   * district string arrived in the request body.
+   */
+  principal: RequestPrincipal;
 }): Promise<{ storageMode: string; district: string | null }> {
-  const { parcelId, document, performedBy, officerBadge, defaultDistrict } = options;
+  const { parcelId, document, performedBy, officerBadge, defaultDistrict, principal } = options;
   const health = getDbHealth();
   const uploadedAt = new Date().toISOString();
   const suppliedDistrict = typeof document.district === 'string' ? document.district.trim() : '';
@@ -431,8 +436,7 @@ export async function linkDocument(options: {
     let client: PoolClient | null = null;
     let filedDistrict: string | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(principal);
 
       const parcel = await client.query('SELECT id, district, document_id, document_name, document_type FROM parcels WHERE id = $1 FOR UPDATE', [parcelId]);
       if (parcel.rows.length === 0) throw new SealRejected('NOT_FOUND', `Parcel ${parcelId} not found.`);
@@ -445,8 +449,10 @@ export async function linkDocument(options: {
         `INSERT INTO land_documents (
           id, parcel_id, document_code, file_name, record_type, ocr_language, raw_ocr_text,
           district, tehsil, village, patwar_circle, status, priority, image_uri,
-          quality_metrics, extracted_data, document_hash, uploaded_by, uploaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19::timestamptz)
+          quality_metrics, extracted_data, document_hash, uploaded_by, uploaded_at,
+          organization_id, organization_granted_by, organization_grant_reason, organization_granted_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19::timestamptz,
+          $20, $21, $22, NOW())
         ON CONFLICT (id) DO UPDATE SET
           parcel_id = EXCLUDED.parcel_id,
           status = EXCLUDED.status,
@@ -474,6 +480,8 @@ export async function linkDocument(options: {
           document.documentHash,
           performedBy,
           uploadedAt,
+          principal.organizationId, `officer:${principal.email}`,
+          `Linked to parcel ${parcelId} through the API by ${performedBy}.`,
         ]
       );
 
@@ -557,7 +565,7 @@ export async function rehomeParcel(input: {
 }): Promise<{ parcelId: string; fromDistrict: string; toDistrict: string; storageMode: string }> {
   const { parcelId, toDistrict, reason, principal } = input;
   const normalise = (v: unknown) => String(v ?? '').trim().toLowerCase();
-  const from = await parcelDistrict(parcelId);
+  const from = await parcelDistrict(principal, parcelId);
 
   if (from === null) throw new SealRejected('NOT_FOUND', `Parcel ${parcelId} not found.`);
   if (normalise(from) === normalise(toDistrict)) {
@@ -581,8 +589,7 @@ export async function rehomeParcel(input: {
   if (health.storageMode === 'postgres-postgis') {
     let client: PoolClient | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(principal);
 
       const locked = await client.query('SELECT district FROM parcels WHERE id = $1 FOR UPDATE', [parcelId]);
       if (locked.rows.length === 0) throw new SealRejected('NOT_FOUND', `Parcel ${parcelId} not found.`);
@@ -677,8 +684,7 @@ export async function setDocumentParcelLink(input: {
     let client: PoolClient | null = null;
     let district: string | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(principal);
 
       const doc = await client.query('SELECT id, parcel_id, file_name, record_type FROM land_documents WHERE id = $1 FOR UPDATE', [documentId]);
       if (doc.rows.length === 0) throw new SealRejected('NOT_FOUND', `Document ${documentId} was not found.`);
@@ -795,6 +801,9 @@ export function mapDocumentRow(row: any) {
     documentHash: row.document_hash,
     ocrConfidence: row.ocr_confidence !== null && row.ocr_confidence !== undefined ? Number(row.ocr_confidence) : undefined,
     uploadedBy: row.uploaded_by,
+    // Required by DocumentScope: an assertion cannot decide tenancy without it, and leaving it
+    // optional would let a caller that forgot to select the column skip the check entirely.
+    organizationId: row.organization_id ?? null,
     uploadedAt: row.uploaded_at,
   };
 }

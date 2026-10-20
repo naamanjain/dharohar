@@ -199,27 +199,48 @@ defect — but it is a real dependency for a government network.
 6. **Document bytes live in PostgreSQL TEXT columns** (base64) — see `docs/DOCUMENT-STORAGE.md`;
    confidentiality depends on the database backup chain, and the "checksum" is over the stored text
    plus the data URI, not over independently verifiable file bytes.
-7. **Row-Level Security is still not implemented, and it is now measurable what that means.** As of
-   2026-10-19 the shipped compose stack connects as the least-privilege `dharohar_app`
-   (`superuser=false`, `bypassrls=false`, DDL/TRUNCATE/DELETE/audit-UPDATE/ledger-INSERT refused by
-   PostgreSQL itself — see `scripts/probe-role.mjs`), and the schema-owner credential is held only by
-   the one-shot `migrate`/`roleinit`/`maint` services. Migration 0004 supplied the tenant structures
-   (`organizations`, `organization_districts`, `organization_units`) and migration 0005 — applied to
-   the demo deployment on 2026-10-20 — made the district identifier the primary key, repointed the
-   child foreign keys at it and kept the code foreign keys as the backstop. The schema is therefore
-   settled; what remains is the policy, the per-transaction GUC, and two data facts:
-   * **nothing is labelled.** Measured on the deployed demo database on 2026-10-20: `organization_id`
-     is NULL on 39 of 39 parcels and on 59 of 59 users, and `land_documents` has no `organization_id`
-     column at all. A tenant policy has no column to filter on yet.
-   * **the application does not consult the tenant at all.** `server/src/services/jurisdiction.ts`
-     authorizes from `user_jurisdictions`; `organizations` and `organization_districts` are read by
-     nothing in the request path. Measured by `server/src/test_tenancy_isolation_suite.ts` on a
-     disposable copy: an officer belonging to a *different* organization, granted the same district
-     personally, reads another organization's parcel with **HTTP 200**, and the record appears in that
-     district's listing. The suite is 17 passed / 4 failed and is expected to stay red until tenant
-     scoping exists — it is the specification RLS has to satisfy, not a regression.
-   Order of work: the labelling decision in `docs/DISTRICT-TENANCY-MODEL.md` §8, then §4 of that file,
-   then the policy. Until policies exist, application authorization is the only layer.
+7. **Tenant isolation is implemented in two layers, and both are tested.** As of 2026-10-21 the shipped
+   stack connects as the least-privilege `dharohar_app` (`superuser=false`, `bypassrls=false`, DDL /
+   TRUNCATE / DELETE / audit-UPDATE / ledger-INSERT refused by PostgreSQL itself —
+   `scripts/probe-role.mjs`), and:
+   * **Layer one, application.** `RequestPrincipal` now carries the officer's `organizationId` and the
+     tenant's active `organization_districts` grants, re-read every request. A record is reachable only
+     when it belongs to the caller's organization AND its district is in the caller's own postings
+     intersected with what the tenant holds (`administers` for writes; `administers`, `audits` or `reads`
+     for reads). `STATE_WIDE_READ` removes the dependence on the officer's own postings and never the
+     dependence on tenancy. The predicate is applied in SQL for lists, searches, counts and the registry
+     aggregates, and in `assertParcelReadable` / `assertParcelWritable` / `assertDocumentReadable` /
+     `assertDocumentWritable` for every detail and nested path, so a route cannot omit it by forgetting
+     to add it.
+   * **Layer two, PostgreSQL row-level security.** `parcels` and `land_documents` carry four policies
+     each (migration 0006), SELECT/INSERT/UPDATE/DELETE separately, requiring the session's organization
+     to match the row **and** to match what `users` says about the session's user id. The GUCs are set
+     with `set_config(..., true)` inside a transaction (`server/src/db/tenant.ts`), never at session
+     scope, so a pooled connection cannot hand its predecessor's tenant to a later request. Unbound
+     reads return zero rows: verified as the runtime role directly, not inferred.
+   * **What a refusal looks like.** Another tenant's record and a record that does not exist produce the
+     same bytes; an officer whose account has no organization gets `403 TENANT_CONTEXT_MISSING` because
+     that is a configuration someone must be able to see.
+   * **Not covered by the second layer, stated plainly.** `parcel_owners`, `parcel_mutations`,
+     `field_inspections` and `user_jurisdictions` have no owner column of their own and no policies; they
+     are scoped through the parcel they hang off, which is RLS-covered, plus the application checks.
+     `users` has no policy because login must resolve the account before any tenant context exists.
+     `append_only_audit_logs` has no policy because entries attached to a parcel are scoped through it
+     (migration 0008 adds actor attribution for the rest) and because chain verification is inherently
+     whole-table.
+   Measured on a disposable copy with `./scripts/test-authorization-on-copy.sh`:
+   `test:jurisdiction` 46/0, `test:provisioning` 91/0, `test_tenancy_isolation_suite.ts` 42/0 — including
+   two tenants granted the same district each reading only their own parcel, listings, search, nested
+   document and inspection routes, the officer roster, registry counts, cross-tenant document download,
+   grant revocation, `audits` opening reads but never writes, and direct SQL as `dharohar_app` with no
+   context, with a forged context, and attempting `SET ROLE` to the owner.
+7b. **Document bytes are stored, retrieved and now round-trip verified.** Re-measured on 2026-10-21: a
+   2,000,000-byte payload written through `POST /api/documents` was read back and hashed to the same
+   digest at rest, and the same payload survived `pg_dump` → second-location copy → restore → compare
+   (`./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups`, all checks green). The register still
+   holds no *scanned* record images beyond those written by the drills, so "the documents are archived"
+   remains false about the demo content even though the storage path works — that is an intake gap, and
+   the audit trail of a seal over an absent image is still unverifiable.
 7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every
    `land_documents` row in the deployment has an empty `image_uri` — OCR text and metadata, no source
    bytes. The one exception is the 1.5 MB payload written deliberately as a backup-drill fixture, and

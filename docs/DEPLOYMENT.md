@@ -246,8 +246,13 @@ docker compose -f docker-compose.prod.yml exec -it \
 #    (0003 is one). It never repairs a row: it names the rows that need a departmental decision.
 npm run test:integrity          # exit 0 = consistent; exit 1 = findings, listed by primary key
 #    Against the containerised stack the database publishes no host port, so run the same check
-#    inside the api container instead — the script is bundled into the image for exactly this:
-docker compose -f docker-compose.prod.yml exec -T api node dist-server/verify_district_integrity.js
+#    through a one-shot service. NOT through `exec api`: since migration 0006 the api container connects
+#    as dharohar_app, which is subject to row-level security and reads zero parcels with no tenant
+#    bound — a checker run that way reports records it cannot see as missing, so it now refuses to run
+#    as that identity. `maint` carries the schema-owner credential, which owns the tables and is
+#    therefore exempt.
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  maint dist-server/verify_district_integrity.js
 
 # 5. Retire the officer accounts the test gate created (it runs suites against this stack, so it
 #    creates real logins in a fabricated domain, and nothing deletes rows by design).
@@ -287,12 +292,31 @@ docker run --rm --entrypoint sh dharohar-prod-migrate:latest -c 'ls -1 /app/dist
 ```
 
 If a filename is missing from either listing, the image is stale and no amount of re-running `migrate`
-will change that. Rebuild both, then apply:
+will change that. Build **every** service, not just the two you thought of: `migrate`, `roleinit` and
+`maint` each have their own `build:` block and therefore their own image, and on 2026-10-21
+`--profile tools build migrate api` left `assignOwnership.js` out of `maint`, which surfaced as
+`Cannot find module`. The one command that cannot miss one:
 
 ```bash
-docker compose -f docker-compose.prod.yml --profile tools build migrate api
+docker compose -f docker-compose.prod.yml --profile tools build
 docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
 ```
+
+### Which migrations exist, and what each one is for
+
+| | What it does | Guarded by |
+| --- | --- | --- |
+| `0001`–`0003` | base schema, jurisdiction model, stable district identifiers and the write-time sync trigger | `npm run test:registry` (its own scratch databases) |
+| `0004` | canonical district registry, `organizations`, `organization_districts`, `organization_units`, the named demo tenant | `scripts/test-tenant-migration.sh` §3–5 |
+| `0005` | the district identifier becomes the primary key; the owner's RJ mapping; probe-pattern fixtures retired | same drill, §5b; `fk_*_district_code` kept as the trigger-bypass backstop |
+| `0006` | record **ownership** distinct from district **jurisdiction**: `land_documents.organization_id`, attribution columns with CHECK constraints, ownership assigned only on a stated basis, row-level security on `parcels` and `land_documents` | same drill, §5c; `scripts/test-authorization-on-copy.sh` proves the policies against `dharohar_app` |
+| `0007` | a declaration is `candidate`, not canonical geography; promotion needs `USER_ADMIN` + a reason | same drill, §5d; `validate-stack.sh` asserts the default and that retired fixtures stay retired |
+| `0008` | audit entries record `actor_user_id` / `actor_organization_id`, outside the entry hash | same drill, §5e — including that the chain digest is unchanged by a re-apply |
+
+Each of `0006`, `0007` and `0008` aborts if the migration it is stated against has not been applied, so
+they cannot be applied out of order, and each has a `rollback-NNNN.sql` that refuses rather than
+guessing: 0006's refuses to erase a human ownership assignment, 0007's refuses while candidate districts
+are unresolved.
 
 ### Prove a migration on a copy before the runner ever sees it
 

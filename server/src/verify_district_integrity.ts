@@ -42,6 +42,30 @@ async function main() {
     process.exit(2);
   }
 
+  // This report must be produced by an identity that can SEE the register. Since migration 0006 the
+  // runtime role is subject to row-level security with no tenant bound, so as `dharohar_app` it reads
+  // zero parcels — and the report then invents findings ("owner row references a parcel that does not
+  // exist") about records that are merely invisible to it. A diagnostic that cannot tell "absent" from
+  // "hidden from me" is worse than no diagnostic, because someone signs off on it.
+  // Refuse the identity instead of producing it.
+  const identity = await pool.query(
+    `select current_user as who,
+            (select rolsuper from pg_roles where rolname = current_user) as super,
+            (select rolbypassrls from pg_roles where rolname = current_user) as bypass,
+            (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
+              where c.oid = 'parcels'::regclass) as parcels_owner`
+  );
+  const id = identity.rows[0] ?? {};
+  const exempt = id.super === true || id.bypass === true || id.parcels_owner === id.who;
+  if (!exempt) {
+    console.error(`[INTEGRITY] refusing to run as "${id.who}": that role is subject to row-level security and would report records it cannot see as missing.`);
+    console.error('[INTEGRITY] Run it as the schema owner instead:');
+    console.error('  docker compose -f docker-compose.prod.yml --profile tools run --rm maint dist-server/verify_district_integrity.js');
+    await pool.end().catch(() => {});
+    process.exit(2);
+  }
+  console.log(`  identity    : ${id.who} (owner of parcels: ${id.parcels_owner === id.who ? 'yes' : 'no'}, bypassrls: ${String(id.bypass)}) — exempt from row-level security, so this report sees the whole register`);
+
   const has = async (relation: string) => {
     const r = await pool.query('SELECT to_regclass($1) AS o', [relation]);
     return r.rows[0].o !== null;
@@ -128,7 +152,7 @@ async function main() {
       where not exists (select 1 from user_jurisdictions j where j.user_id = u.id and j.revoked_at is null)
         and not exists (select 1 from user_capabilities c where c.user_id = u.id and c.revoked_at is null)
       order by u.id`,
-    'officer holds no active jurisdiction and no capability — they can be authenticated but can reach nothing'
+    'officer holds no active jurisdiction and no capability — they can reach no record at all. Whether they can still sign in is not established here: the retire step replaces the password with a value that is never printed, and this query does not read credentials.'
   ));
 
   findings.push(...await rows(
@@ -221,17 +245,60 @@ async function main() {
     console.log('  note  migration 0003 is not applied, so district_code consistency was not checked.\n');
   }
 
+  // ---- 7. Ownership: the quarantine queue, split by whether it is expected ----
+  // Since migration 0006 a record with no owner is invisible to every tenant. For a parcel under a
+  // RETIRED test fixture that is the owner's standing decision (isolated synthetic history, never
+  // attached to an organization), so it is reported as a note. A record with no owner inside a live
+  // district is a different thing: somebody's land record that no tenant may work on. That is a finding.
+  const orphanLive = await rows(
+    `select p.id || ' (' || p.district_code || ')' as detail
+       from parcels p join districts d on d.code = p.district_code
+      where p.organization_id is null and d.kind in ('canonical','candidate') and d.is_active
+      order by p.id`,
+    'parcel has no owner while sitting in a live district — no tenant can read it and no tenant is responsible for it (disposition: server/src/db/assignOwnership.ts)'
+  );
+  findings.push(...orphanLive);
+
+  const orphanDocs = await rows(
+    `select d.id || ' (' || coalesce(d.district_code, 'no district') || ')' as detail
+       from land_documents d
+        where d.organization_id is null
+          and (d.parcel_id is null or not exists (select 1 from parcels p where p.id = d.parcel_id and p.organization_id is not null))
+        order by d.id`,
+    'document has no owner and inherits none from a linked parcel — it is filed, and readable by nobody'
+  );
+  findings.push(...orphanDocs);
+
+  const quarantineNotes = await pool.query(
+    `select
+       (select count(*)::int from parcels p join districts d on d.code = p.district_code
+         where p.organization_id is null and d.kind = 'retired') as fixture_parcels,
+       (select count(*)::int from users where organization_id is null) as unowned_officers,
+       (select count(*)::int from districts where kind = 'candidate') as candidate_districts,
+       (select count(*)::int from organization_districts where revoked_at is null) as active_grants`
+  );
+  const qn = quarantineNotes.rows[0];
+
   // ---- Notes: known-incomplete but not broken ---------------------------------
   const notes: string[] = [];
   const orgCount = Number((await pool.query('select count(*)::int as n from organizations')).rows[0].n);
   if (orgCount === 0) {
-    notes.push('no organization (tenant) rows exist, so every district and officer is tenant-less. That is the D1');
-    notes.push('decision waiting on the revenue department, not corrupt data — but it means cross-tenant isolation is untested.');
+    notes.push('no organization (tenant) rows exist, so cross-tenant isolation cannot be exercised at all. That is a');
+    notes.push('decision waiting on the revenue department, not corrupt data — see docs/DISTRICT-TENANCY-MODEL.md §8.');
   } else {
-    const unowned = (await pool.query(
-      `select count(*)::int as n from districts where organization_id is null`
-    )).rows[0].n;
-    if (Number(unowned) > 0) notes.push(`${unowned} registered district(s) have no organization_id yet.`);
+    // districts.organization_id being NULL is the settled model, not a gap: geography is shared between
+    // tenants and authority over it lives in organization_districts. Reporting the old column as a
+    // problem would point an operator at the wrong table.
+    notes.push(`tenants: ${orgCount}; active organization_districts grants: ${qn.active_grants}. District rows are shared geography and carry no owner: authority is granted through organization_districts.`);
+    if (Number(qn.candidate_districts) > 0) {
+      notes.push(`${qn.candidate_districts} district(s) are declared but not yet canonical geography — promote or retire them (POST /api/admin/districts/:code/promote).`);
+    }
+    if (Number(qn.fixture_parcels) > 0) {
+      notes.push(`${qn.fixture_parcels} parcel(s) under retired test fixtures are deliberately unowned (isolated synthetic history, owner decision 2026-10-19). They stay quarantined.`);
+    }
+    if (Number(qn.unowned_officers) > 0) {
+      notes.push(`${qn.unowned_officers} officer account(s) belong to no organization, so they can administer nothing and read no record.`);
+    }
   }
   const declared = Number((await pool.query(
     `select count(*)::int as n from districts where provenance = 'declared'`

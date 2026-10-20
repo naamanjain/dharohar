@@ -342,6 +342,155 @@ chk "restored trigger does NOT fill the identifier (0003 body, not 0005's)" "0" 
 out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0005.sql 2>&1); rc=$?
 chk "0005 re-applies after rollback" "0" "$rc"
 
+# ---- 5c. migration 0006: record ownership, distinct from district jurisdiction --
+# This section proves the *mechanics*: the columns and constraints appear, the assignment lands where
+# its stated basis puts it, quarantine is real, the file is idempotent, and the rollback refuses
+# before erasing a human decision. It does NOT prove row-level security behaves — this harness
+# connects as the cluster superuser, which is the table owner and is exempt from policies. The
+# behaviour of those policies against the actual runtime role is measured by
+# scripts/test-authorization-on-copy.sh, which applies scripts/roles.sql first.
+say "== apply 0006 (tenant ownership + row-level security) =="
+docker cp server/src/db-draft/0006_tenant_ownership.sql $SCRATCH:/tmp/0006.sql >/dev/null
+docker cp server/src/db-draft/rollback-0006.sql $SCRATCH:/tmp/rollback-0006.sql >/dev/null
+CANON_PARCELS="$(q "select count(*) from parcels p join districts d on d.code = p.district_code and d.kind = 'canonical'")"
+FIXTURE_PARCELS="$(q "select count(*) from parcels p join districts d on d.code = p.district_code and d.kind = 'retired'")"
+say "  basis: $CANON_PARCELS parcel(s) in canonical districts, $FIXTURE_PARCELS under retired fixtures"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/0006.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'NOTICE|ERROR' | sed 's/^/    /' | tail -16)"
+chk "0006 apply exits 0" "0" "$rc"
+chk "documents gained an owner column" "1" "$(q "select count(*) from information_schema.columns where table_name='land_documents' and column_name='organization_id'")"
+chk "the three record tables enforce attribution structurally" "3" "$(q "select count(*) from pg_constraint where conname in ('ck_parcels_ownership_is_attributed','ck_land_documents_ownership_is_attributed','ck_users_ownership_is_attributed')")"
+chk "four policies on each of the two root tables" "8" "$(q "select count(*) from pg_policies where tablename in ('parcels','land_documents')")"
+chk "SELECT/INSERT/UPDATE/DELETE each covered on parcels" "4" "$(q "select count(distinct cmd) from pg_policies where tablename='parcels'")"
+chk "row-level security enabled on both root tables" "2" "$(q "select count(*) from pg_class where relname in ('parcels','land_documents') and relrowsecurity")"
+# The assignment must be exactly what its stated basis produces — not "some rows got an owner".
+chk "every parcel in a canonical district is owned, and attributed" "$CANON_PARCELS" \
+    "$(q "select count(*) from parcels p join districts d on d.code=p.district_code and d.kind='canonical' where p.organization_id='ORG-DHAROHAR-DEMO' and p.organization_granted_by='migration:0006' and length(btrim(p.organization_grant_reason))>=5")"
+chk "fixture parcels were NOT assigned (owner decision 2026-10-19: isolated history)" "0" \
+    "$(q "select count(*) from parcels p join districts d on d.code=p.district_code where d.kind<>'canonical' and p.organization_id is not null")"
+# Quarantine has to be populated or "unowned rows stay invisible" is untested. Asserted as a premise,
+# not assumed from the demo data set.
+chk "premise: some parcels really are quarantined on this copy" "1" "$([ "$FIXTURE_PARCELS" -gt 0 ] && echo 1 || echo 0)"
+chk "quarantined parcels are exactly the non-canonical ones" "$FIXTURE_PARCELS" \
+    "$(q "select count(*) from parcels where organization_id is null")"
+chk "documents with no district and no parcel are quarantined, not invented into a tenant" "1" \
+    "$(q "select case when count(*)>0 then 1 else 0 end from land_documents where organization_id is null and district_code is null and parcel_id is null")"
+
+BEFORE_6_RECOUNT="$(q "select count(*) filter (where organization_id is not null) from parcels")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0006.sql 2>&1); rc=$?
+chk "0006 re-apply exits 0 (idempotent)" "0" "$rc"
+chk "0006 re-apply assigned nothing further" "$BEFORE_6_RECOUNT" "$(q "select count(*) filter (where organization_id is not null) from parcels")"
+
+say "== rollback of 0006 =="
+# A guard that has never been broken is not a guard: stamp one row as a human decision and require the
+# refusal before testing the clean path.
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q >/dev/null 2>&1 <<'HUMAN'
+update parcels set organization_granted_by='registrar@department.example',
+                   organization_grant_reason='Assigned by a named person after review.'
+         where id='DH-JPR-RAM-001024';
+HUMAN
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/rollback-0006.sql 2>&1); rc=$?
+say "  rollback with a human assignment -> exit $rc"
+say "$(echo "$out" | grep -E 'ROLLBACK_REFUSED' | head -1 | sed 's/^/    /')"
+chk "rollback refused to erase a human ownership decision" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q >/dev/null 2>&1 <<'RESTORE'
+update parcels set organization_granted_by='migration:0006' where id='DH-JPR-RAM-001024';
+RESTORE
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/rollback-0006.sql 2>&1); rc=$?
+# Print the failure, not just its exit code: this rollback was red for a statement in its own report
+# block, and a bare "want 0, got 3" gave no way to find that without re-running by hand.
+say "$(echo "$out" | grep -E 'NOTICE|ERROR' | sed 's/^/    /' | tail -8)"
+chk "rollback-0006 exits 0 once the human row is accounted for" "0" "$rc"
+chk "policies gone" "0" "$(q "select count(*) from pg_policies where tablename in ('parcels','land_documents')")"
+chk "row-level security disabled again" "0" "$(q "select count(*) from pg_class where relname in ('parcels','land_documents') and relrowsecurity")"
+chk "documents owner column removed" "0" "$(q "select count(*) from information_schema.columns where table_name='land_documents' and column_name='organization_id'")"
+chk "attribution columns removed from all three tables" "0" "$(q "select count(*) from information_schema.columns where column_name='organization_granted_by'")"
+# After a clean rollback nothing is owned — not just the rows 0006 assigned, but the fixtures that
+# were already unowned too. The expected number is therefore the whole table, not CANON_PARCELS; the
+# first version of this line asserted 25 and reported 37, which was the assertion being wrong.
+chk "ownership released back to quarantine across the whole table" "$(q "select count(*) from parcels")" \
+    "$(q "select count(*) from parcels where organization_id is null")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0006.sql 2>&1); rc=$?
+chk "0006 re-applies after rollback" "0" "$rc"
+
+# ---- 5d. migration 0007: a declaration is not canonical geography --------------
+say "== apply 0007 (declaration workflow) =="
+docker cp server/src/db-draft/0007_declaration_is_not_geography.sql $SCRATCH:/tmp/0007.sql >/dev/null
+docker cp server/src/db-draft/rollback-0007.sql $SCRATCH:/tmp/rollback-0007.sql >/dev/null
+CANON_BEFORE="$(q "select count(*) from districts where kind='canonical'")"
+RETIRED_BEFORE="$(q "select count(*) from districts where kind='retired'")"
+RJ_BEFORE="$(q "select count(*) from districts where state_code='RJ'")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/0007.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'NOTICE|ERROR' | sed 's/^/    /' | tail -10)"
+chk "0007 apply exits 0" "0" "$rc"
+chk "a new declaration no longer defaults to canonical" "'candidate'::text" \
+    "$(q "select column_default from information_schema.columns where table_name='districts' and column_name='kind'")"
+chk "candidate is in the domain" "1" "$(q "select count(*) from pg_constraint where conname='ck_districts_kind_domain'")"
+# Phase 2 says explicitly: preserve 0005 and the owner's RJ mapping. Asserted as unchanged counts,
+# not as "the migration reported success".
+chk "0007 promoted nothing on its own" "$CANON_BEFORE" "$(q "select count(*) from districts where kind='canonical'")"
+chk "0007 un-retired nothing" "$RETIRED_BEFORE" "$(q "select count(*) from districts where kind='retired'")"
+chk "the four RJ mappings survived 0007" "$RJ_BEFORE" "$(q "select count(*) from districts where state_code='RJ'")"
+declare_res=$(docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -tA -f /dev/stdin 2>&1 <<'DECL'
+insert into districts (code, name, provenance) values ('harness 07 declare', 'Harness 07 Declare', 'declared');
+select 'kind=' || kind from districts where code = 'harness 07 declare';
+delete from districts where code = 'harness 07 declare';
+DECL
+)
+chk "the ordinary declare path lands as candidate, not geography" "kind=candidate" \
+    "$(echo "$declare_res" | grep -o 'kind=[a-z_]*' | head -1)"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0007.sql 2>&1); rc=$?
+chk "0007 re-apply exits 0 (idempotent)" "0" "$rc"
+
+say "== rollback of 0007 =="
+# Guard first, deliberately: while a candidate exists the old domain would reject the row, and the
+# operator must be told that as a decision rather than as a constraint error.
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q >/dev/null 2>&1 <<'CAND'
+insert into districts (code, name, provenance) values ('harness 07 pending', 'Harness 07 Pending', 'declared');
+CAND
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/rollback-0007.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ROLLBACK_REFUSED' | head -1 | sed 's/^/    /')"
+chk "rollback refused while a candidate is unresolved" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+chk "the refusal named the pending district" "1" "$(echo "$out" | grep -c 'harness 07 pending')"
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q >/dev/null 2>&1 <<'CLEAR'
+delete from districts where code = 'harness 07 pending';
+CLEAR
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/rollback-0007.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ERROR' | head -3 | sed 's/^/    /')"
+chk "rollback-0007 exits 0 once the queue is clear" "0" "$rc"
+chk "default restored to canonical" "'canonical'::text" \
+    "$(q "select column_default from information_schema.columns where table_name='districts' and column_name='kind'")"
+chk "0004's own constraint name restored" "1" "$(q "select count(*) from pg_constraint where conname='districts_kind_check'")"
+chk "candidate no longer in the domain" "0" "$(q "select count(*) from pg_constraint where conname='ck_districts_kind_domain'")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0007.sql 2>&1); rc=$?
+chk "0007 re-applies after rollback" "0" "$rc"
+
+# ---- 5e. migration 0008: audit actor attribution ------------------------------
+say "== apply 0008 (audit actor attribution) =="
+AUDIT_BEFORE="$(q "select count(*) from append_only_audit_logs")"
+docker cp server/src/db-draft/0008_audit_actor_attribution.sql $SCRATCH:/tmp/0008.sql >/dev/null
+docker cp server/src/db-draft/rollback-0008.sql $SCRATCH:/tmp/rollback-0008.sql >/dev/null
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/0008.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'NOTICE|ERROR' | sed 's/^/    /' | tail -4)"
+chk "0008 apply exits 0" "0" "$rc"
+chk "the two attribution columns exist" "2" "$(q "select count(*) from information_schema.columns where table_name='append_only_audit_logs' and column_name in ('actor_user_id','actor_organization_id')")"
+# Additive means the chain is untouched: same row count, same hashes. Asserting the count alone would
+# not catch a rewrite, so the hash sum is compared too.
+HASH_BEFORE="$(q "select md5(string_agg(entry_hash, '' order by id)) from append_only_audit_logs")"
+AUDIT_AFTER="$(q "select count(*) from append_only_audit_logs")"
+chk "0008 wrote no audit rows and deleted none" "$AUDIT_BEFORE" "$AUDIT_AFTER"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0008.sql 2>&1); rc=$?
+chk "0008 re-apply exits 0 (idempotent)" "0" "$rc"
+chk "the chain still hashes to the same value after a re-apply" "$HASH_BEFORE" \
+    "$(q "select md5(string_agg(entry_hash, '' order by id)) from append_only_audit_logs")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/rollback-0008.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ERROR' | head -2 | sed 's/^/    /')"
+chk "rollback-0008 exits 0" "0" "$rc"
+chk "columns removed again" "0" "$(q "select count(*) from information_schema.columns where table_name='append_only_audit_logs' and column_name in ('actor_user_id','actor_organization_id')")"
+chk "the audit table itself was not emptied by the rollback" "$AUDIT_BEFORE" "$(q "select count(*) from append_only_audit_logs")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0008.sql 2>&1); rc=$?
+chk "0008 re-applies after rollback" "0" "$rc"
+
 # ---- 6. the guards, on a copy where nothing has been applied yet ---------------
 say "== abort cases (fresh copy, guards must fire) =="
 maint "create database $DB_ABORT;" >/dev/null
@@ -400,6 +549,31 @@ out=$(docker exec $SCRATCH psql -U postgres -d "$DB_ABORT" -f /tmp/rollback-0004
 say "  6c rollback with a human-made grant -> exit $rc"
 say "$(echo "$out" | grep -E 'ROLLBACK_REFUSED' | head -1 | sed 's/^/    /')"
 chk "6c rollback refused instead of deleting a real grant" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+
+# 6d. 0006's assignment basis is "this environment has exactly one tenant". Once a second
+#     organization exists — which is precisely the situation a real deployment creates — that basis is
+#     gone, and the file must stop rather than guess which tenant owns each record. DB_ABORT already
+#     holds ORG-REAL-1 from 6c, so the condition is real data, not a mocked premise.
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_ABORT" -f /tmp/0006.sql 2>&1); rc=$?
+say "  6d a second tenant present -> exit $rc"
+say "$(echo "$out" | grep -E 'TENANCY_AMBIGUOUS_TENANT|ORG-REAL-1' | head -2 | sed 's/^/    /')"
+chk "6d aborted rather than guessing an owner" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+chk "6d named the competing organization" "1" "$(echo "$out" | grep -c 'ORG-REAL-1')"
+chk "6d left the documents table untouched (no organization_id column)" "0" \
+    "$(docker exec -i $SCRATCH psql -U postgres -d "$DB_ABORT" -tA -c "select count(*) from information_schema.columns where table_name='land_documents' and column_name='organization_id'")"
+chk "6d left every record unowned" "0" "$(docker exec -i $SCRATCH psql -U postgres -d "$DB_ABORT" -tA -c "select count(*) from parcels where organization_id is not null")"
+
+# 6e. 0007 states which migrations it is built on. On this copy neither 0005 nor 0006 has been applied,
+#     so it must refuse rather than half-apply — a registry whose kind domain changed underneath an
+#     un-migrated key would be the exact half-state this ordering guard exists to prevent.
+docker cp server/src/db-draft/0007_declaration_is_not_geography.sql $SCRATCH:/tmp/0007.sql >/dev/null
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_ABORT" -f /tmp/0007.sql 2>&1); rc=$?
+say "  6e 0007 ahead of its requirements -> exit $rc"
+say "$(echo "$out" | grep -E 'REQUIREMENT_MISSING' | head -1 | sed 's/^/    /')"
+chk "6e aborted because 0005/0006 are missing" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+chk "6e named the missing requirement" "1" "$(echo "$out" | grep -c 'REQUIREMENT_MISSING')"
+chk "6e left the kind default alone" "'canonical'::text" \
+    "$(docker exec -i $SCRATCH psql -U postgres -d "$DB_ABORT" -tA -c "select column_default from information_schema.columns where table_name='districts' and column_name='kind'")"
 
 # ---- cleanup -------------------------------------------------------------------
 say "== cleanup =="

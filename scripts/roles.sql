@@ -88,7 +88,13 @@ DECLARE
     -- authorization layer reads on every request. The API must be able to READ these to decide
     -- anything at all, and must be able to WRITE them only through the provisioning service, which
     -- is the same statement path — so they are granted like the operational tables.
-    'organizations', 'districts', 'user_jurisdictions', 'user_capabilities'
+    'organizations', 'districts', 'user_jurisdictions', 'user_capabilities',
+    -- From migration 0004. loadPrincipal reads organization_districts on EVERY authenticated request,
+    -- because a tenant's district authority has to take effect — and be revoked — immediately rather
+    -- than at token expiry. Without SELECT here the authorization layer cannot decide anything and
+    -- every request fails closed with AUTHORIZATION_UNAVAILABLE, which is what this grant was missing.
+    -- organization_units is read by the registry listing. Neither is deletable by this role: see 3b.
+    'organization_districts', 'organization_units'
   ];
 BEGIN
   FOREACH t IN ARRAY ops LOOP
@@ -123,7 +129,8 @@ BEGIN
 
   -- Explicitly withheld. Listed so that a future reader can see this was decided, not forgotten.
   FOREACH t IN ARRAY ARRAY['parcels', 'land_documents', 'field_inspections', 'parcel_mutations',
-                           'organizations', 'districts', 'user_jurisdictions', 'user_capabilities'] LOOP
+                           'organizations', 'districts', 'user_jurisdictions', 'user_capabilities',
+                           'organization_districts', 'organization_units'] LOOP
     IF to_regclass(t) IS NOT NULL THEN
       EXECUTE format('REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE %I FROM dharohar_app', t);
     END IF;

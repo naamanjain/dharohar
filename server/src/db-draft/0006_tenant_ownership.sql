@@ -1,0 +1,265 @@
+-- =============================================================================
+-- DHAROHAR — DRAFT migration 0006: record OWNERSHIP, distinct from district JURISDICTION
+--
+-- Read server/src/db-draft/0004_canonical_districts_and_tenants.sql first. 0004 created the tenant
+-- structures and the district<->organization relationship; 0005 made the district identifier
+-- authoritative. Neither said which organization a *record* belongs to, and nothing in the
+-- application consults `organizations` today — which is why an officer of one tenant can read another
+-- tenant's parcel in a district both are granted (measured: HTTP 200, see
+-- server/src/test_tenancy_isolation_suite.ts).
+--
+-- THE TWO CONCEPTS, KEPT APART ON PURPOSE:
+--
+--   * Record ownership — `parcels.organization_id`, `land_documents.organization_id`,
+--     `users.organization_id`. Who the record belongs to. Written only with a `granted_by` and a
+--     `reason`, which the CHECK constraints below make structurally impossible to skip.
+--   * District jurisdiction — `organization_districts` (administers | audits | reads) and, per
+--     officer, `user_jurisdictions`. Which districts an organization may work in.
+--
+-- A district grant NEVER implies ownership of a record in that district, and it is normal for two
+-- organizations to hold grants over the same district while owning different records there. The two
+-- predicates are applied independently in the application and in the row-level policies below; an
+-- access is allowed only when BOTH hold.
+--
+-- QUARANTINE. `organization_id IS NULL` means ownership has not been established. Quarantined rows
+-- are preserved and remain reachable through owner-identity tooling (`scripts/probe-role.mjs`, the
+-- integrity checker run as the schema owner) but are invisible to every tenant identity — the
+-- row-level policies compare against the session's organization and `NULL = anything` is not true.
+-- This migration does not promote a row it cannot account for: 11 parcels under retired test fixtures
+-- and the documents with neither a district nor a parcel stay unowned, deliberately, because the
+-- owner's decision of 2026-10-19 says those fixtures are isolated synthetic history and must not be
+-- attached to any organization.
+--
+-- WHAT THIS MIGRATION ASSERTS ABOUT THE DATA, AND WHY IT IS REVERSIBLE:
+--   It assigns ownership of records in CANONICAL districts to `ORG-DHAROHAR-DEMO` on exactly one
+--   basis: this database has only ever been the synthetic demo deployment (seeding it requires
+--   SEED_CONFIRM=demo), and 0004 created that organization as the tenant *of this demo environment*
+--   under the owner's instruction to migrate existing fixtures "only where the mapping is
+--   unambiguous". It writes `organization_granted_by = 'migration:0006'` and a reason on every row it
+--   touches so the claim is attributable and revocable, and it ABORTS if a second organization exists
+--   — because the moment more than one tenant is present, "the environment has one tenant" stops being
+--   evidence about any particular record. `rollback-0006.sql` reverses it and refuses to run if a human
+--   has since assigned ownership through the disposition path.
+--
+-- Drill copy: psql -v ON_ERROR_STOP=1 -f this file. The runner copy is derived by
+-- scripts/build-tenant-migration.mjs (which strips \set, BEGIN; and COMMIT; only).
+-- =============================================================================
+
+\set ON_ERROR_STOP on
+BEGIN;
+
+-- ---- 1. The ownership column the documents table never had -------------------
+-- parcels and users have carried organization_id since 0002/0003; a document — the thing an officer
+-- uploads, the thing a seal is issued over — had no owner at all, so there was nothing to scope a
+-- download by. Same type and same reference as the existing columns, by convention.
+ALTER TABLE land_documents ADD COLUMN IF NOT EXISTS organization_id VARCHAR(64);
+
+DO $do$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_land_documents_organization_id') THEN
+    ALTER TABLE land_documents
+      ADD CONSTRAINT fk_land_documents_organization_id
+      FOREIGN KEY (organization_id) REFERENCES organizations(id);
+  END IF;
+END
+$do$;
+
+CREATE INDEX IF NOT EXISTS idx_land_documents_organization_id
+  ON land_documents (organization_id);
+
+-- Attribution columns. Ownership without a recorded grantor and reason is the silent assignment this
+-- file must not perform, so the database refuses to store it.
+ALTER TABLE parcels        ADD COLUMN IF NOT EXISTS organization_granted_by   TEXT;
+ALTER TABLE parcels        ADD COLUMN IF NOT EXISTS organization_grant_reason TEXT;
+ALTER TABLE parcels        ADD COLUMN IF NOT EXISTS organization_granted_at   TIMESTAMPTZ;
+ALTER TABLE land_documents ADD COLUMN IF NOT EXISTS organization_granted_by   TEXT;
+ALTER TABLE land_documents ADD COLUMN IF NOT EXISTS organization_grant_reason TEXT;
+ALTER TABLE land_documents ADD COLUMN IF NOT EXISTS organization_granted_at   TIMESTAMPTZ;
+ALTER TABLE users          ADD COLUMN IF NOT EXISTS organization_granted_by   TEXT;
+ALTER TABLE users          ADD COLUMN IF NOT EXISTS organization_grant_reason TEXT;
+ALTER TABLE users          ADD COLUMN IF NOT EXISTS organization_granted_at   TIMESTAMPTZ;
+
+-- CHECK constraints take no subqueries (PostgreSQL rejects them outright — 0004 learned this), and a
+-- row with no owner is legal, so the condition only bites once an owner is present.
+DO $do$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['parcels','land_documents','users'] LOOP
+    EXECUTE format(
+      'ALTER TABLE %I DROP CONSTRAINT IF EXISTS ck_%I_ownership_is_attributed', t, t);
+    EXECUTE format(
+      $q$ALTER TABLE %I ADD CONSTRAINT ck_%I_ownership_is_attributed
+            CHECK (organization_id IS NULL
+                   OR (organization_granted_by IS NOT NULL
+                       AND length(btrim(organization_grant_reason)) >= 5))$q$, t, t);
+    RAISE NOTICE '[0006] ownership attribution CHECK enforced on %', t;
+  END LOOP;
+END
+$do$;
+
+-- ---- 2. Guard: the single-tenant basis for the assignment, or stop -----------
+DO $do$
+DECLARE
+  demo_org      constant text := 'ORG-DHAROHAR-DEMO';
+  others        text;
+  other_count   integer;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM organizations WHERE id = demo_org) THEN
+    RAISE EXCEPTION E'[TENANCY_TENANT_MISSING] % does not exist.\n  0004 creates it. Assigning ownership needs exactly one tenant to assign to, and this database has none.', demo_org
+      USING HINT = 'Apply migration 0004 first. Do not create the organization by hand: the mapping in this file is tied to the tenant 0004 defines.';
+  END IF;
+
+  -- The moment a second organization exists, "this environment has one tenant" is no longer evidence
+  -- about any individual record, and guessing which one owns what is exactly the invention that has
+  -- been refused since 0004.
+  SELECT count(*), string_agg(o.id, ', ' ORDER BY o.id) INTO other_count, others
+    FROM organizations o WHERE o.id <> demo_org;
+  IF other_count > 0 THEN
+    RAISE EXCEPTION E'[TENANCY_AMBIGUOUS_TENANT] % organization(s) besides the demo tenant exist: %.\n  Nothing was changed: with more than one tenant, record ownership has to be established per record from a source this migration does not have, not inferred from which district the record happens to sit in.', other_count, others
+      USING HINT = 'Assign ownership through the disposition command (server/src/db/assignOwnership.ts) with a named grantor and a reason, or make this file''s assignment before any real tenant is created.';
+  END IF;
+END
+$do$;
+
+-- ---- 3. Assign ownership where the basis is stated, and report the rest ------
+DO $do$
+DECLARE
+  demo_org   constant text := 'ORG-DHAROHAR-DEMO';
+  grantor    constant text := 'migration:0006';
+  reason_par text := 'Synthetic demo-environment record in a canonical district of the one tenant this deployment has ever had (0004). Demo data only: not a statement about real land records.';
+  reason_doc text := 'Inherits the recorded owner of the parcel it is linked to; where it is unlinked, the same demo-environment basis as its parcel.';
+  reason_usr text := 'Officer of the synthetic demo environment, assigned to a canonical district. Demo data only.';
+  n          integer;
+  left_      integer;
+  canon      text[];
+BEGIN
+  SELECT array_agg(d.code) INTO canon FROM districts d WHERE d.kind = 'canonical';
+  IF canon IS NULL OR array_length(canon, 1) = 0 THEN
+    RAISE EXCEPTION E'[TENANCY_NO_CANONICAL_GEOGRAPHY] the registry has no canonical districts, so there is no defined basis for an assignment. Nothing was changed.';
+  END IF;
+  RAISE NOTICE '[0006] canonical districts defining the basis: %', array_to_string(canon, ', ');
+
+  -- Parcels whose district is a retired test fixture are deliberately NOT assigned: the owner's
+  -- decision of 2026-10-19 keeps them isolated synthetic history.
+  UPDATE parcels p
+     SET organization_id           = demo_org,
+         organization_granted_by   = grantor,
+         organization_grant_reason = reason_par,
+         organization_granted_at   = now()
+   WHERE p.organization_id IS NULL
+     AND p.district_code = ANY(canon);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE '[0006] parcels assigned to the demo tenant: %', n;
+
+  SELECT count(*) INTO left_ FROM parcels WHERE organization_id IS NULL;
+  RAISE NOTICE '[0006] parcels LEFT QUARANTINED (no established owner, invisible to tenants): %', left_;
+
+  -- Documents follow their linked parcel first — that is a recorded relationship, not an inference —
+  -- and only then the district basis.
+  UPDATE land_documents ld
+     SET organization_id           = p.organization_id,
+         organization_granted_by   = grantor,
+         organization_grant_reason = reason_doc,
+         organization_granted_at   = now()
+    FROM parcels p
+   WHERE ld.parcel_id = p.id
+     AND ld.organization_id IS NULL
+     AND p.organization_id IS NOT NULL;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE '[0006] documents inheriting their linked parcel''s owner: %', n;
+
+  UPDATE land_documents ld
+     SET organization_id           = demo_org,
+         organization_granted_by   = grantor,
+         organization_grant_reason = reason_doc,
+         organization_granted_at   = now()
+   WHERE ld.organization_id IS NULL
+     AND ld.district_code = ANY(canon);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE '[0006] unlinked documents assigned on the district basis: %', n;
+
+  SELECT count(*) INTO left_ FROM land_documents WHERE organization_id IS NULL;
+  RAISE NOTICE '[0006] documents LEFT QUARANTINED: %', left_;
+
+  UPDATE users u
+     SET organization_id           = demo_org,
+         organization_granted_by   = grantor,
+         organization_grant_reason = reason_usr,
+         organization_granted_at   = now()
+   WHERE u.organization_id IS NULL
+     AND u.district_code = ANY(canon);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE '[0006] officers assigned to the demo tenant: %', n;
+
+  SELECT count(*) INTO left_ FROM users WHERE organization_id IS NULL;
+  RAISE NOTICE '[0006] officers LEFT QUARANTINED (suite residue under retired fixtures): %', left_;
+END
+$do$;
+
+-- ---- 4. Row-level security on the two root tenant-scoped tables --------------
+-- Enabled, not FORCED: the schema owner must still be able to migrate, seed and diagnose, and that
+-- owner credential is held only by the one-shot services (see scripts/roles.sql). Every policy names
+-- the runtime role explicitly so a future role cannot inherit a permissive default by accident.
+--
+-- FAIL CLOSED, TWICE OVER. The session's organization must (a) equal the row's owner, and (b) equal
+-- what the users table says about the session's user id. Either GUC unset makes the comparison NULL,
+-- which is not true, so no row is visible or writable. An unowned row can never satisfy (a).
+ALTER TABLE parcels        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE land_documents ENABLE ROW LEVEL SECURITY;
+
+-- SELECT and the write commands are separate policies on purpose: one permissive policy for all
+-- commands would let a WITH CHECK clause do the work of a USING clause and filter rows the caller
+-- should never have seen.
+DO $do$
+DECLARE
+  t text;
+  cmd text;
+  body text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['parcels','land_documents'] LOOP
+    FOREACH cmd IN ARRAY ARRAY['SELECT','INSERT','UPDATE','DELETE'] LOOP
+      EXECUTE format('DROP POLICY IF EXISTS tenant_%s_%I ON %I', lower(cmd), t, t);
+    END LOOP;
+
+    -- The predicate is identical for every command; only the clause changes.
+    body := $q$(organization_id = current_setting('app.organization_id', true)
+             AND current_setting('app.organization_id', true) = (
+                   SELECT u.organization_id FROM users u
+                    WHERE u.id = current_setting('app.user_id', true)
+                      AND u.organization_id IS NOT NULL))$q$;
+
+    EXECUTE format('CREATE POLICY tenant_select_%I ON %I AS PERMISSIVE FOR SELECT TO dharohar_app USING %s', t, t, body);
+    EXECUTE format('CREATE POLICY tenant_insert_%I ON %I AS PERMISSIVE FOR INSERT TO dharohar_app WITH CHECK %s', t, t, body);
+    EXECUTE format('CREATE POLICY tenant_update_%I ON %I AS PERMISSIVE FOR UPDATE TO dharohar_app USING %s WITH CHECK %s', t, t, body, body);
+    EXECUTE format('CREATE POLICY tenant_delete_%I ON %I AS PERMISSIVE FOR DELETE TO dharohar_app USING %s', t, t, body);
+    RAISE NOTICE '[0006] row-level security enabled on % with four tenant policies', t;
+  END LOOP;
+END
+$do$;
+
+-- ---- 5. Report --------------------------------------------------------------
+DO $do$
+DECLARE
+  r record;
+BEGIN
+  RAISE NOTICE '[0006] ===== post-state =====';
+  -- Every branch of the UNION is cast to text: the first one was, the others were not, and
+  -- `UNION types text and bigint cannot be matched` aborted the whole migration on its last
+  -- statement, rolling back an assignment that had already succeeded.
+  FOR r IN SELECT 'parcels' AS t, count(*)::text AS rows_,
+                   count(*) FILTER (WHERE organization_id IS NULL)::text AS quarantined
+            FROM parcels
+         UNION ALL SELECT 'land_documents', count(*)::text, count(*) FILTER (WHERE organization_id IS NULL)::text FROM land_documents
+         UNION ALL SELECT 'users', count(*)::text, count(*) FILTER (WHERE organization_id IS NULL)::text FROM users
+  LOOP
+    RAISE NOTICE '[0006] %: rows=% quarantined=%', r.t, r.rows_, r.quarantined;
+  END LOOP;
+  RAISE NOTICE '[0006] tables under row-level security: %',
+    (SELECT string_agg(c.relname, ', ' ORDER BY c.relname) FROM pg_class c
+      WHERE c.relrowsecurity AND c.relname IN ('parcels','land_documents'));
+  RAISE NOTICE '[0006] ===== end =====';
+END
+$do$;
+
+COMMIT;

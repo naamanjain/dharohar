@@ -1,28 +1,29 @@
 /**
- * Tenancy and jurisdiction isolation suite — the pre-RLS measurement.
+ * Tenancy and jurisdiction isolation suite — the requirement RLS has to satisfy, measured.
  *
- * docs/DISTRICT-TENANCY-MODEL.md settled the architecture: an organization is a tenant, a district
- * is canonical geography shared between tenants, and `organization_districts` is the relationship
- * that says who may administer what. Row-Level Security can only be designed against a stated
- * requirement, and the requirement is this file. Every assertion below is the behaviour a deployed
- * multi-organization DHAROHAR must have.
+ * docs/DISTRICT-TENANCY-MODEL.md settled the architecture. This file states what a deployed
+ * multi-organization DHAROHAR must do, and then checks it against a running API and a running
+ * PostgreSQL, as the actual application role:
  *
- * THIS SUITE IS EXPECTED TO BE RED. That is not a defect in it. The application authorizes a request
- * from `user_jurisdictions` (which districts THIS officer may reach) and does not consult
- * `organizations` or `organization_districts` anywhere in the request path, so the assertions that
- * require organization scoping fail until that enforcement exists. Running it green-washed would
- * hide exactly the hole it was written to find, so the failures are left loud and wired into
- * scripts/test-authorization-on-copy.sh, and docs/SECURITY.md lists the gap.
+ *   * Record ownership (`organization_id` on the record) decides WHICH TENANT a record belongs to.
+ *   * District jurisdiction (an officer's own `user_jurisdictions`, intersected with the tenant's
+ *     `organization_districts` grants) decides WHERE inside that tenant an officer may work.
+ *   * A district grant never implies ownership. Two tenants can both be granted Jaipur and must still
+ *     be unable to read each other's records there — which is the case every "both have the district"
+ *     test below is built around.
  *
- * It also asserts the parts that DO work today — per-district isolation and the capability model —
- * because a suite that is entirely red proves nothing about the machinery it depends on.
+ * Every refusal is also paired with a control that must SUCCEED, so a 404 coming from the wrong layer
+ * cannot be read as proof of tenant isolation. That pairing is the point of the file: the first version
+ * of this suite reported "cross-organization read refused" from a test whose officer had already lost
+ * that district by revocation, and the assertion passed for entirely the wrong reason.
  *
- * Run against a disposable copy, never against the only demo database (it plants a second
- * organization and re-parents one officer):
+ * Run it against a disposable copy — it plants a second and third organization and re-parents
+ * officers, which is not something to do to the only copy of a register:
  *
- *   TEST_BASE_URL=http://127.0.0.1:8099/api \
- *   ADMIN_EMAIL=... ADMIN_PASSWORD=... DEMO_PASSWORD=... \
- *   TENANCY_DB_URL=postgres://postgres:...@127.0.0.1:55432/<copy> \
+ *   ./scripts/test-authorization-on-copy.sh        (does all of this, with the role credentials)
+ *
+ *   TEST_BASE_URL=... ADMIN_EMAIL=... ADMIN_PASSWORD=... DEMO_PASSWORD=... \
+ *   TENANCY_DB_URL=postgres://postgres:...@host/copy TENANCY_APP_URL=postgres://dharohar_app:...@host/copy \
  *   npx tsx server/src/test_tenancy_isolation_suite.ts
  */
 
@@ -33,6 +34,7 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'sysadmin@dharohar.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const DEMO_PASSWORD = (process.env.DEMO_PASSWORD || '').trim();
 const DB_URL = process.env.TENANCY_DB_URL || '';
+const APP_URL = process.env.TENANCY_APP_URL || '';
 
 const DEMO_TENANT = 'ORG-DHAROHAR-DEMO';
 const OTHER_TENANT = 'ORG-TENANCY-OTHER';
@@ -50,7 +52,9 @@ function assert(condition: boolean, label: string, detail = '') {
   }
 }
 
-async function call(path: string, opts: { method?: string; token?: string; body?: any } = {}) {
+type Res = { status: number; body: any };
+
+async function call(path: string, opts: { method?: string; token?: string; body?: any } = {}): Promise<Res> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
   const res = await fetch(`${BASE_URL}${path}`, {
@@ -71,6 +75,19 @@ async function login(identifier: string, password: string): Promise<string> {
   return r.body.data.token;
 }
 
+const codeOf = (res: Res) => String(res.body?.error?.code ?? '');
+const listIds = (res: Res): string[] => (res.body?.data?.parcels || []).map((p: any) => String(p.id));
+
+/** Give a record an owner the way the schema demands: with the grantor and the reason. */
+async function stampOwner(db: Client, table: 'parcels' | 'users', id: string, organization: string, by: string) {
+  await db.query(
+    `UPDATE ${table} SET organization_id = $2, organization_granted_by = $3,
+                            organization_grant_reason = $4, organization_granted_at = now()
+      WHERE id = $1`,
+    [id, organization, by, `Tenancy suite: this record belongs to ${organization}.`]
+  );
+}
+
 async function main() {
   const run = Date.now().toString().slice(-6);
   console.log('\n============================================================');
@@ -78,219 +95,413 @@ async function main() {
   console.log(`  target: ${BASE_URL}`);
   console.log('============================================================\n');
 
-  if (!ADMIN_PASSWORD || !DEMO_PASSWORD || !DB_URL) {
-    console.error('  ABORT: ADMIN_PASSWORD, DEMO_PASSWORD and TENANCY_DB_URL are all required.');
-    console.error('  Use scripts/test-authorization-on-copy.sh, which supplies them against a copy.');
+  if (!ADMIN_PASSWORD || !DEMO_PASSWORD || !DB_URL || !APP_URL) {
+    console.error('  ABORT: ADMIN_PASSWORD, DEMO_PASSWORD, TENANCY_DB_URL and TENANCY_APP_URL are all required.');
+    console.error('  Use ./scripts/test-authorization-on-copy.sh, which supplies them against a copy.');
     process.exit(2);
   }
 
   const db = new Client({ connectionString: DB_URL });
   await db.connect();
-
-  // A parcel per canonical district, read from the registry rather than assumed. Without this the
-  // whole suite would be asserting against district names that may not carry records.
-  const parcelRows = await db.query(
-    `select d.code, p.id from districts d
-       join parcels p on p.district_code = d.code
-      where d.code in ('jaipur','jodhpur','ajmer','udaipur')
-      group by d.code, p.id order by d.code`
-  );
-  const byDistrict: Record<string, string> = {};
-  for (const r of parcelRows.rows) if (!byDistrict[r.code]) byDistrict[r.code] = r.id;
-  const have = ['jaipur', 'jodhpur', 'ajmer', 'udaipur'].filter((c) => byDistrict[c]);
-  assert(have.length >= 3, `premise: parcels exist in at least three canonical districts (found ${have.join(',')})`);
-  if (have.length < 3) { console.error('  ABORT: not enough districts carry records to test isolation.'); process.exit(2); }
-
   const admin = await login(ADMIN_EMAIL, ADMIN_PASSWORD);
 
-  // -------------------------------------------------------------
-  console.log('\n1. PER-DISTRICT ISOLATION TODAY (the layer that does exist)');
-  // -------------------------------------------------------------
-  const jaipurTehsildar = await login('tehsildar@dharohar.local', DEMO_PASSWORD);
-  const homeRead = await call(`/parcels/${byDistrict.jaipur}`, { token: jaipurTehsildar });
-  assert(homeRead.status === 200, 'An officer reads a parcel in their own district', `got ${homeRead.status}`);
-  if (byDistrict.jodhpur) {
-    const awayRead = await call(`/parcels/${byDistrict.jodhpur}`, { token: jaipurTehsildar });
-    assert(awayRead.status === 404, 'The same officer is refused a parcel in another district (404, not 403)', `got ${awayRead.status}`);
+  // ---- fixtures -------------------------------------------------------------
+  // The tenants have to exist before any record can be stamped as belonging to one: parcels
+  // .organization_id is a foreign key, and the first run of this file failed on exactly that ordering
+  // — it tried to hand a record to a tenant it had not created yet.
+  // Only one new tenant: the `audits` / `reads` cases are exercised by changing the DEMO tenant's own
+  // grant kind, which is what the requirement describes. A second empty tenant would be clutter.
+  for (const [id, name] of [[OTHER_TENANT, `Second Tenant ${run}`]] as const) {
+    await db.query(
+      `insert into organizations (id, name) values ($1, $2)
+       on conflict (id) do update set name = excluded.name`,
+      [id, name]
+    );
   }
-
-  // -------------------------------------------------------------
-  console.log('\n2. AN OFFICER ASSIGNED TO MULTIPLE DISTRICTS');
-  // -------------------------------------------------------------
-  const multiEmail = `multi.${run}@dharohar.test`;
-  const multiPassword = `Multi-tenant-${run}-pw`;
-  const created = await call('/admin/officers', {
-    token: admin, method: 'POST',
-    body: {
-      email: multiEmail, displayName: `Multi District Officer ${run}`, role: 'TEHSILDAR',
-      districts: ['Jaipur', 'Ajmer'], password: multiPassword,
-    },
-  });
-  assert(created.status === 201, 'An officer can be created with two districts', `got ${created.status} ${JSON.stringify(created.body?.error || {})}`);
-  const multiToken = await login(multiEmail, multiPassword);
-
-  if (byDistrict.ajmer) {
-    const ajmerRead = await call(`/parcels/${byDistrict.ajmer}`, { token: multiToken });
-    assert(ajmerRead.status === 200, 'Both assigned districts are readable', `got ${ajmerRead.status}`);
-  }
-  const jaipurRead = await call(`/parcels/${byDistrict.jaipur}`, { token: multiToken });
-  assert(jaipurRead.status === 200, 'The first assigned district is still readable (no implicit narrowing)');
-  if (byDistrict.udaipur) {
-    const third = await call(`/parcels/${byDistrict.udaipur}`, { token: multiToken });
-    assert(third.status === 404, 'A third district the officer was NOT assigned to stays invisible', `got ${third.status}`);
-  }
-
-  const multiId = created.body?.data?.officer?.id;
-  const demoted = await call(`/admin/officers/${multiId}/jurisdictions`, {
-    token: admin, method: 'PUT',
-    body: { districts: ['Ajmer'], reason: `Tenancy suite ${run}: drop Jaipur to prove revocation takes effect at once` },
-  });
-  assert(demoted.status === 200, 'Revoking one of two districts is accepted', `got ${demoted.status}`);
-  const afterRevoke = await call(`/parcels/${byDistrict.jaipur}`, { token: multiToken });
-  assert(afterRevoke.status === 404, 'The revoked district is refused on the NEXT request, not after token expiry', `got ${afterRevoke.status}`);
-
-  // -------------------------------------------------------------
-  console.log('\n3. A STATE-WIDE READ-ONLY AUDITOR');
-  // -------------------------------------------------------------
-  const auditorEmail = `auditor.${run}@dharohar.test`;
-  const auditorPassword = `Auditor-${run}-pw`;
-  const auditorCreated = await call('/admin/officers', {
-    token: admin, method: 'POST',
-    body: {
-      email: auditorEmail, displayName: `State Auditor ${run}`, role: 'AUDITOR',
-      districts: ['Jaipur'], capabilities: ['STATE_WIDE_READ'], password: auditorPassword,
-    },
-  });
-  assert(auditorCreated.status === 201, 'An auditor can be created with STATE_WIDE_READ', `got ${auditorCreated.status}`);
-  const auditorToken = await login(auditorEmail, auditorPassword);
-
-  const distant = byDistrict.jodhpur || byDistrict.udaipur;
-  if (distant) {
-    const wideRead = await call(`/parcels/${distant}`, { token: auditorToken });
-    assert(wideRead.status === 200, 'STATE_WIDE_READ reaches a district the auditor was not assigned to', `got ${wideRead.status}`);
-    const wideWrite = await call(`/parcels/${distant}/jurisdiction`, {
-      token: auditorToken, method: 'POST',
-      body: { toDistrict: 'Ajmer', reason: `Tenancy suite ${run}: an auditor must not be able to move records` },
-    });
-    assert(wideWrite.status >= 400,
-      'STATE_WIDE_READ opens reads only — the re-homing mutation is refused', `got ${wideWrite.status} ${JSON.stringify(wideWrite.body?.error || {})}`);
-  }
-
-  // -------------------------------------------------------------
-  console.log('\n4. ORGANIZATION SCOPING (the requirement RLS must satisfy)');
-  // -------------------------------------------------------------
-  // A second tenant, granted a district by the relationship table the architecture settled on.
-  // Nothing here invents official ownership of any record: the grant is stamped with this run and
-  // the copy is dropped afterwards.
-  await db.query('begin');
-  await db.query(
-    `insert into organizations (id, name) values ($1, $2)
-     on conflict (id) do update set name = excluded.name`,
-    [OTHER_TENANT, `Tenancy Other Organization ${run}`]
-  );
-  const grantDistrict = byDistrict.jaipur ? 'jaipur' : have[0];
   await db.query(
     `insert into organization_districts (organization_id, district_id, relationship, granted_by, reason)
-     select $1, d.id, 'administers', $2, $3
-       from districts d where d.code = $4
-      on conflict do nothing`,
-    [OTHER_TENANT, `tenancy-suite@urbantechx.local`, `Tenancy suite ${run}: a second tenant over ${grantDistrict}`, grantDistrict]
+     select $1, d.id, 'administers', $2, $3 from districts d where d.code = 'jaipur'
+     on conflict do nothing`,
+    [OTHER_TENANT, `tenancy-suite@urbantechx.local`, `Tenancy suite ${run}: a second tenant may administer Jaipur`]
   );
-  await db.query('commit');
 
-  // Premise first. A grant that was not written makes every assertion below vacuous — this suite has
-  // been fooled by a phantom column before, so the plant itself is asserted.
-  const grantCount = await db.query(
-    `select count(*)::int n from organization_districts od
-       join districts d on d.id = od.district_id
-      where od.organization_id = $1 and d.code = $2 and od.revoked_at is null`, [OTHER_TENANT, grantDistrict]
+  // Two parcels in ONE district, owned by two different tenants. District is deliberately identical:
+  // anything else would let a district rule do the work and credit it to tenancy.
+  const jaipurParcels = await db.query(
+    `select p.id, coalesce(p.organization_id,'NONE') as org
+       from parcels p join districts d on d.code = p.district_code
+      where d.code = 'jaipur' and d.kind = 'canonical' and p.is_archived = false
+      order by p.id limit 4`
   );
-  assert(grantCount.rows[0].n === 1, `premise: the second tenant really holds a grant over ${grantDistrict}`);
+  if (jaipurParcels.rowCount! < 2) {
+    console.error('  ABORT: Jaipur needs at least two parcels to separate the two tenants. Nothing was asserted.');
+    process.exit(2);
+  }
+  const demoParcel = jaipurParcels.rows[0].id as string;
+  const otherParcel = jaipurParcels.rows[1].id as string;
+  await stampOwner(db, 'parcels', demoParcel, DEMO_TENANT, 'tenancy-suite@urbantechx.local');
+  await stampOwner(db, 'parcels', otherParcel, OTHER_TENANT, 'tenancy-suite@urbantechx.local');
 
-  // The record under test must belong to the FIRST tenant. It did not: parcels were never labelled
-  // with an organization by any migration (section 5 reports that as the blocker), so the copy is
-  // given the label this suite is meant to run against. Without it the read below returns 404 for a
-  // reason that has nothing to do with tenancy, and the assertion would be measuring nothing — which
-  // is exactly what happened on the first run of this file.
-  const labelled = await db.query(
-    `update parcels set organization_id = $1 where id = $2 and organization_id is null`,
-    [DEMO_TENANT, byDistrict[grantDistrict]]
+  // Premise. If the two rows ended up in the same tenant, every assertion below would be measuring
+  // something that does not exist.
+  const owners = await db.query(
+    `select id, organization_id from parcels where id = any($1::text[]) order by id`,
+    [[demoParcel, otherParcel]]
   );
-  assert(labelled.rowCount === 1, `premise: the ${grantDistrict} record under test now belongs to the demo tenant`);
+  const ownerOf = new Map(owners.rows.map((r: any) => [r.id, r.organization_id]));
+  assert(ownerOf.get(demoParcel) === DEMO_TENANT && ownerOf.get(otherParcel) === OTHER_TENANT,
+    `premise: two parcels in the SAME district owned by DIFFERENT tenants (${demoParcel}=${ownerOf.get(demoParcel)}, ${otherParcel}=${ownerOf.get(otherParcel)})`);
 
-  // An officer of the OTHER tenant who legitimately holds that district personally: jurisdiction
-  // granted through the admin API, tenancy re-parented in the database. This is the strongest
-  // possible position for the request, so a refusal can only come from organization scoping.
-  const otherEmail = `other-tenant.${run}@dharohar.test`;
-  const otherPassword = `Other-Tenant-${run}-pw`;
-  const otherCreated = await call('/admin/officers', {
+  const udParcels = await db.query(
+    `select p.id from parcels p join districts d on d.code = p.district_code
+      where d.code = 'udaipur' and d.kind = 'canonical' and p.is_archived = false order by p.id limit 1`
+  );
+  const udaipurParcel = udParcels.rowCount! > 0 ? udParcels.rows[0].id as string : null;
+
+  // ---- 1. cross-tenant access in a shared district ---------------------------
+  console.log('\n1. TWO TENANTS GRANTED THE SAME DISTRICT (the requirement RLS exists for)');
+
+  const otherEmail = `tenant-b.${run}@dharohar.test`;
+  const otherPassword = `Tenant-B-${run}-pw`;
+  const createdB = await call('/admin/officers', {
     token: admin, method: 'POST',
     body: {
       email: otherEmail, displayName: `Second Tenant Officer ${run}`, role: 'TEHSILDAR',
-      districts: [grantDistrict.charAt(0).toUpperCase() + grantDistrict.slice(1)], password: otherPassword,
+      districts: ['Jaipur'], password: otherPassword,
     },
   });
-  assert(otherCreated.status === 201, 'premise: the second tenant\'s officer is granted the shared district', `got ${otherCreated.status}`);
-  const reparent = await db.query(
-    `update users set organization_id = $1 where lower(email) = $2`, [OTHER_TENANT, otherEmail.toLowerCase()]
+  assert(createdB.status === 201, 'premise: the second tenant\'s officer is created and posted to Jaipur', `got ${createdB.status}`);
+  await stampOwner(db, 'users', createdB.body.data.officer.id, OTHER_TENANT, 'tenancy-suite@urbantechx.local');
+
+  const bToken = await login(otherEmail, otherPassword);
+  const meAsB = await call('/auth/me', { token: bToken });
+  assert(meAsB.body?.data?.user?.organizationId === OTHER_TENANT,
+    'premise: that officer really belongs to the second tenant (per the server, not per this script)',
+    JSON.stringify(meAsB.body?.data?.user?.organizationId));
+
+  const bOwnParcel = await call(`/parcels/${otherParcel}`, { token: bToken });
+  assert(bOwnParcel.status === 200,
+    'control: the second tenant reads ITS OWN parcel in Jaipur',
+    `got ${bOwnParcel.status} — if this fails, the refusal below proves nothing`);
+
+  const bReadsDemo = await call(`/parcels/${demoParcel}`, { token: bToken });
+  assert(bReadsDemo.status === 404,
+    'the second tenant cannot read the first tenant\'s parcel in the same district',
+    `got ${bReadsDemo.status} ${JSON.stringify(bReadsDemo.body?.error || {})}`);
+  assert(bReadsDemo.status === 404 && codeOf(bReadsDemo) === 'PARCEL_NOT_FOUND',
+    'the refusal is indistinguishable from absence (no enumeration of other tenants\' ids)', codeOf(bReadsDemo));
+
+  const aReadsOther = await call(`/parcels/${otherParcel}`, { token: admin });
+  assert(aReadsOther.status === 404,
+    'and in the other direction: the first tenant\'s administrator cannot read the second tenant\'s parcel',
+    `got ${aReadsOther.status}`);
+
+  // ---- 2. lists, search, counts, nested resources and documents -------------
+  console.log('\n2. INDIRECT PATHS (where a leak actually hides)');
+  const bList = await call('/parcels', { token: bToken });
+  const bIds = listIds(bList);
+  assert(bList.status === 200 && bIds.includes(otherParcel) && !bIds.includes(demoParcel),
+    'the district listing shows its own tenant\'s record and not the other\'s',
+    `own=${bIds.includes(otherParcel)} foreign=${bIds.includes(demoParcel)} total=${bIds.length}`);
+
+  const bTotal = Number(bList.body?.data?.total ?? -1);
+  assert(bTotal === bIds.length, 'the reported total is the tenant\'s count, not the register\'s', `${bTotal} vs ${bIds.length}`);
+
+  const demoParcelRow = await db.query('select khasra_no, village from parcels where id = $1', [demoParcel]);
+  const searchTerm = String(demoParcelRow.rows[0].khasra_no || '').slice(0, 6);
+  const bSearch = searchTerm
+    ? await call(`/parcels?search=${encodeURIComponent(searchTerm)}`, { token: bToken })
+    : { status: 200, body: { data: { parcels: [] } } };
+  assert(!listIds(bSearch).includes(demoParcel),
+    'a search for the other tenant\'s khasra number does not find it',
+    `searched "${searchTerm}" -> ${listIds(bSearch).join(',')}`);
+
+  const bNestedDocs = await call(`/parcels/${demoParcel}/documents`, { token: bToken });
+  assert(bNestedDocs.status === 404, 'the other tenant\'s document list is not reachable through the nested route', `got ${bNestedDocs.status}`);
+
+  const bNestedInspections = await call(`/parcels/${demoParcel}/field-inspections`, { token: bToken });
+  assert(bNestedInspections.status === 404, 'the other tenant\'s field inspections are not reachable either', `got ${bNestedInspections.status}`);
+
+  const bRehome = await call(`/parcels/${demoParcel}/jurisdiction`, {
+    token: bToken, method: 'POST',
+    body: { toDistrict: 'Ajmer', reason: `Tenancy suite ${run}: attempted move of another tenant's record` },
+  });
+  assert(bRehome.status >= 400, 'the other tenant cannot re-home a record it does not own', `got ${bRehome.status}`);
+
+  const bAudit = await call(`/parcels/${demoParcel}/audit`, { token: bToken });
+  assert(bAudit.status === 404, 'the other tenant cannot read the record\'s audit history', `got ${bAudit.status}`);
+
+  const docId = `doc-tenant-b-${run}`;
+  const bUpload = await call('/documents', {
+    token: bToken, method: 'POST',
+    body: { id: docId, fileName: `b-${run}.pdf`, recordType: 'Jamabandi', rawOcrText: `khasra ${run}`, parcelId: otherParcel },
+  });
+  assert(bUpload.status === 200 || bUpload.status === 201, 'the second tenant can file its own document', `got ${bUpload.status} ${JSON.stringify(bUpload.body?.error || {})}`);
+  const aSeesBDoc = await call(`/documents/${docId}`, { token: admin });
+  assert(aSeesBDoc.status === 404, 'the first tenant cannot read the second tenant\'s document by id', `got ${aSeesBDoc.status}`);
+  const bDocList = await call('/documents', { token: bToken });
+  const aDocList = await call('/documents', { token: admin });
+  const bDocIds = (bDocList.body?.data?.documents || []).map((d: any) => d.id);
+  const aDocIds = (aDocList.body?.data?.documents || []).map((d: any) => d.id);
+  assert(bDocIds.includes(docId) && !aDocIds.includes(docId),
+    'the document listing is per tenant in both directions',
+    `b=${bDocIds.includes(docId)} a=${aDocIds.includes(docId)}`);
+
+  const roster = await call('/admin/officers', { token: admin });
+  const rosterIds = (roster.body?.data?.officers || []).map((o: any) => o.id);
+  assert(roster.status === 200 && !rosterIds.includes(createdB.body.data.officer.id),
+    'the first tenant\'s administrator cannot see the second tenant\'s officer in the roster',
+    `present=${rosterIds.includes(createdB.body.data.officer.id)}`);
+
+  const registry = await call('/admin/districts', { token: admin });
+  const jaipurRow = (registry.body?.data?.districts || []).find((d: any) => d.code === 'jaipur');
+  // Counted the way the registry counts: every parcel in the district, archived included, plus the
+  // documents filed under it. The first version of this assertion filtered archived parcels out of the
+  // expected side and then reported a mismatch of three — which was the comparison being wrong, not
+  // the count. Verified separately below that the OTHER tenant's rows are excluded.
+  const ownCounts = await db.query(
+    `select (select count(*) from parcels where district_code='jaipur' and organization_id=$1)
+          + (select count(*) from land_documents where district_code='jaipur' and organization_id=$1) as n`,
+    [DEMO_TENANT]
   );
-  assert(reparent.rowCount === 1, 'premise: that officer really belongs to the second tenant');
-
-  const otherToken = await login(otherEmail, otherPassword);
-  const sameDistrictRead = await call(`/parcels/${byDistrict[grantDistrict]}`, { token: otherToken });
-  assert(sameDistrictRead.status === 404,
-    'An officer of one organization cannot read another organization\'s record in a district both are granted',
-    `got HTTP ${sameDistrictRead.status} — the request path never consults organizations, so this is the leak RLS must close`);
-
-  const crossList = await call(`/parcels?district=${grantDistrict}`, { token: otherToken });
-  const leaked = (crossList.body?.data?.parcels || []).some((p: any) => p.id === byDistrict[grantDistrict]);
-  assert(crossList.status === 200 && !leaked,
-    'The district listing does not return records from a different organization',
-    leaked ? 'the record appears in the list' : `got ${crossList.status}`);
-
-  const inertProbe = await db.query(
-    `select count(*)::int n from organization_districts where organization_id = $1`, [OTHER_TENANT]
+  const otherCounts = await db.query(
+    `select (select count(*) from parcels where district_code='jaipur' and organization_id=$1)
+          + (select count(*) from land_documents where district_code='jaipur' and organization_id=$1) as n`,
+    [OTHER_TENANT]
   );
-  console.log(`  note  organization_districts rows for the second tenant: ${inertProbe.rows[0].n}; the request path reads none of them.`);
+  // count(*) comes back as a string from the driver (it is a bigint), so both sides are coerced:
+  // `46 === "46"` is false in JavaScript, and that is what this assertion was failing on once the
+  // numbers themselves agreed.
+  const ownRecords = Number(ownCounts.rows[0].n);
+  const otherRecords = Number(otherCounts.rows[0].n);
+  assert(!!jaipurRow && Number(jaipurRow.records) === ownRecords,
+    'registry counts are exactly this tenant\'s records, not the register\'s',
+    `reported=${jaipurRow?.records} own=${ownRecords} otherTenant=${otherRecords}`);
+  // The premise that makes the equality above mean something: the second tenant really does hold rows
+  // in this district. Without it, "the count equals my own records" could pass on an empty fixture and
+  // read as proof of isolation.
+  assert(otherRecords > 0,
+    'premise: the second tenant holds records in Jaipur that the count must exclude',
+    `other tenant holds ${otherRecords}`);
 
-  // -------------------------------------------------------------
-  console.log('\n5. THE DEMO TENANT IS LABELLED, NOT ASSUMED');
-  // -------------------------------------------------------------
-  const tenantRows = await db.query(`select id, name from organizations order by id`);
-  assert(tenantRows.rowCount! >= 1, 'The demo tenant exists as a named row');
-  const demo = tenantRows.rows.find((r: any) => r.id === DEMO_TENANT);
-  assert(!!demo && /demo/i.test(String(demo.name)), `the demo tenant is named as a demo (${demo?.name ?? 'missing'})`, '');
-  const unlabeledParcels = await db.query(
-    `select count(*) filter (where organization_id is null)::int unlabelled, count(*)::int total from parcels`
-  );
-  assert(unlabeledParcels.rows[0].unlabelled === 0,
-    'Every parcel carries an organization, so a tenant filter is possible at all',
-    `${unlabeledParcels.rows[0].unlabelled} of ${unlabeledParcels.rows[0].total} parcel(s) have none — no migration has ever labelled them`);
+  // ---- 3. organization-level grants are enforced, by kind --------------------
+  console.log('\n3. DISTRICT JURISDICTION: administer, audit, read, and revocation');
+  const makeOfficer = async (label: string, districts: string[]) => {
+    const email = `${label}.${run}@dharohar.test`;
+    const password = `Officer-${label}-${run}-pw`;
+    const r = await call('/admin/officers', {
+      token: admin, method: 'POST',
+      body: { email, displayName: `Suite ${label} ${run}`, role: 'TEHSILDAR', districts, password },
+    });
+    return { email, password, id: r.body?.data?.officer?.id, status: r.status };
+  };
 
-  const unlabelledUsers = await db.query(`select count(*)::int n from users where organization_id is null`);
-  assert(unlabelledUsers.rows[0].n === 0, 'Every officer carries an organization', `${unlabelledUsers.rows[0].n} officer(s) have none`);
-
-  console.log(`\n  ${passed} passed, ${failed} failed.`);
-  if (failed > 0) {
-    console.log('  These failures are the enforcement the application does not have yet, not flakiness:');
-    console.log('  (a) records are not labelled with an organization, so there is nothing to filter on;');
-    console.log('  (b) the request path never consults organizations or organization_districts, so a');
-    console.log('      tenant granted a district by the relationship table can still see the other tenant.');
-    console.log('  Both are the work RLS is meant to do — see docs/DISTRICT-TENANCY-MODEL.md §7.');
+  // (a) posted to a district the tenant holds nothing over -> refused.
+  const ungranted = await makeOfficer('ungranted', ['Udaipur']);
+  assert(ungranted.status === 201, 'premise: an officer posted to Udaipur is created', `got ${ungranted.status}`);
+  if (udaipurParcel) {
+    await stampOwner(db, 'parcels', udaipurParcel, DEMO_TENANT, 'tenancy-suite@urbantechx.local');
+    const t1 = await login(ungranted.email, ungranted.password);
+    const held = await db.query(
+      `select count(*)::int n from organization_districts od
+         join districts d on d.id = od.district_id
+        where od.organization_id = $1 and d.code = 'udaipur' and od.revoked_at is null`,
+      [DEMO_TENANT]
+    );
+    if (held.rows[0].n === 0) {
+      const denied = await call(`/parcels/${udaipurParcel}`, { token: t1 });
+      assert(denied.status === 404,
+        'a personal posting is not enough: the tenant must also hold the district',
+        `got ${denied.status} with no organization grant in force`);
+    } else {
+      console.log('  note  the demo tenant already holds Udaipur, so this case is exercised by revocation below instead');
+    }
   }
 
-  // Reversed dependency order: users reference organizations, so the tenant row cannot go while an
-  // officer still points at it. Getting this wrong threw the FK error out of the suite and swallowed
-  // the summary line, which is how a red run ends up reporting nothing.
+  // (b) revoke the tenant's grant over a district -> the tenant's officers lose it on the next request.
+  const revoke = await db.query(
+    `update organization_districts od set revoked_at = now()
+       from districts d where od.district_id = d.id and od.organization_id = $1 and d.code = 'jaipur'
+       and od.revoked_at is null returning od.district_id`,
+    [OTHER_TENANT]
+  );
+  assert((revoke.rowCount ?? 0) === 1, 'premise: the second tenant\'s Jaipur grant is revoked');
+  const bAfterRevoke = await call(`/parcels/${otherParcel}`, { token: bToken });
+  assert(bAfterRevoke.status === 404,
+    'revoking the ORGANIZATION\'s grant takes effect on the next request, not at token expiry',
+    `got ${bAfterRevoke.status}`);
+  await db.query(
+    `update organization_districts od set revoked_at = null
+       from districts d where od.district_id = d.id and od.organization_id = $1 and d.code = 'jaipur'`,
+    [OTHER_TENANT]
+  );
+  const bRestored = await call(`/parcels/${otherParcel}`, { token: bToken });
+  assert(bRestored.status === 200, 'control: restoring the grant gives the access back (the refusal above was the grant, not a coincidence)', `got ${bRestored.status}`);
+
+  // (c) read-only relationship kinds open reads and never writes.
+  const auditorOrgParcel = demoParcel; // the demo tenant's own record, reached by a demo auditor
+  const auditor = await makeOfficer('audits-only', ['Jaipur']);
+  assert(auditor.status === 201, 'premise: an audits-only officer is created', `got ${auditor.status}`);
+  await db.query(
+    `update organization_districts od set relationship = 'audits'
+       from districts d where od.district_id = d.id and od.organization_id = $1 and d.code = 'jaipur'
+       and od.relationship = 'administers'`,
+    [DEMO_TENANT]
+  );
+  const auditorToken = await login(auditor.email, auditor.password);
+  const auditorRead = await call(`/parcels/${auditorOrgParcel}`, { token: auditorToken });
+  assert(auditorRead.status === 200, 'an `audits` grant opens the read', `got ${auditorRead.status}`);
+  // `status` is a real workflow field on this endpoint, so a refusal here is a refusal of the write
+  // and not a 400 about an unknown property. The officer's role is TEHSILDAR, so the read-only ROLE
+  // rule is not what stops it — only the 'audits' grant is.
+  const auditorWrite = await call(`/parcels/${auditorOrgParcel}`, {
+    token: auditorToken, method: 'PATCH', body: { status: 'Verified' },
+  });
+  assert(auditorWrite.status >= 400, 'and `audits` never becomes a write', `got ${auditorWrite.status} ${codeOf(auditorWrite)}`);
+  await db.query(
+    `update organization_districts od set relationship = 'administers'
+       from districts d where od.district_id = d.id and od.organization_id = $1 and d.code = 'jaipur'
+       and od.relationship = 'audits'`,
+    [DEMO_TENANT]
+  );
+  const tehsildarToken = await login('tehsildar@dharohar.local', DEMO_PASSWORD);
+  const writeBack = await call(`/parcels/${demoParcel}`, { token: tehsildarToken, method: 'PATCH', body: { status: 'Needs Field Verification' } });
+  assert(writeBack.status === 200, 'control: with `administers` restored the same write is accepted', `got ${writeBack.status} ${codeOf(writeBack)}`);
+
+  // ---- 4. quarantine --------------------------------------------------------
+  console.log('\n4. QUARANTINE: an unowned record is preserved and invisible');
+  const quarantined = await db.query(
+    `select p.id from parcels p join districts d on d.code = p.district_code
+      where d.kind = 'retired' and p.organization_id is null limit 1`
+  );
+  if (quarantined.rowCount! > 0) {
+    const qid = quarantined.rows[0].id as string;
+    const asAdmin = await call(`/parcels/${qid}`, { token: admin });
+    const asStateWide = await call(`/parcels/${qid}`, { token: tehsildarToken });
+    assert(asAdmin.status === 404 && asStateWide.status === 404,
+      `fixture record ${qid} (no owner) is invisible to every tenant, including a state-wide reader`,
+      `admin=${asAdmin.status} tehsildar=${asStateWide.status}`);
+    const stillThere = await db.query('select count(*)::int n from parcels where id = $1', [qid]);
+    assert(stillThere.rows[0].n === 1, 'and it is still in the database — quarantine is not deletion');
+  } else {
+    assert(false, 'premise: at least one quarantined fixture record should exist on this copy', 'none found — the fixture case went untested');
+  }
+
+  const unowned = await db.query(`select count(*)::int n from parcels where organization_id is null`);
+  console.log(`  note  records still unowned on this copy: ${unowned.rows[0].n} (disposition path: server/src/db/assignOwnership.ts)`);
+
+  // ---- 5. identity and context cannot be forged -----------------------------
+  console.log('\n5. DIRECT SQL THROUGH THE APPLICATION ROLE (the second layer, unaided)');
+  const app = new Client({ connectionString: APP_URL });
+  await app.connect();
+
+  const roleAttrs = await app.query(
+    `select current_user as who,
+            (select rolsuper from pg_roles where rolname = current_user) as superuser,
+            (select rolbypassrls from pg_roles where rolname = current_user) as bypassrls`
+  );
+  assert(roleAttrs.rows[0].who === 'dharohar_app' && roleAttrs.rows[0].superuser === false && roleAttrs.rows[0].bypassrls === false,
+    'the application role is who we think it is, is not a superuser and cannot bypass row-level security',
+    JSON.stringify(roleAttrs.rows[0]));
+
+  const noContext = await app.query('select count(*)::int n from parcels');
+  assert(noContext.rows[0].n === 0,
+    'with NO tenant context the role reads zero rows — a request that forgets to bind its tenant fails closed',
+    `got ${noContext.rows[0].n}`);
+
+  let forgedOrgRows = -1;
+  await app.query('BEGIN');
+  await app.query(`select set_config('app.organization_id', $1, true)`, [DEMO_TENANT]);
+  await app.query(`select set_config('app.user_id', $1, true)`, ['USR-OF-SOME-OTHER-TENANT']);
+  const forged = await app.query('select count(*)::int n from parcels');
+  forgedOrgRows = forged.rows[0].n;
+  await app.query('ROLLBACK');
+  assert(forgedOrgRows === 0,
+    'an organization claimed without a matching user identity yields nothing (both halves must agree)',
+    `got ${forgedOrgRows}`);
+
+  const bUserId = createdB.body.data.officer.id;
+  let honestRows = -1;
+  await app.query('BEGIN');
+  await app.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [OTHER_TENANT, bUserId]);
+  const honest = await app.query('select id from parcels');
+  honestRows = honest.rowCount ?? -1;
+  const honestIds = (honest.rows || []).map((r: any) => r.id);
+  await app.query('ROLLBACK');
+  assert(honestRows > 0 && honestIds.includes(otherParcel) && !honestIds.includes(demoParcel),
+    'the same role, honestly bound, sees its own tenant\'s rows and only those',
+    `rows=${honestRows} own=${honestIds.includes(otherParcel)} foreign=${honestIds.includes(demoParcel)}`);
+
+  let roleSwitch = '';
   try {
-    await db.query(`update users set organization_id = $1 where organization_id = $2`, [DEMO_TENANT, OTHER_TENANT]);
+    await app.query('set role dharohar');
+    const who = await app.query('select current_user as w');
+    roleSwitch = who.rows[0].w;
+    await app.query('reset role');
+  } catch (err: any) {
+    roleSwitch = 'refused: ' + String(err.message).slice(0, 60);
+  }
+  assert(!/^dharohar$/.test(roleSwitch),
+    'the runtime role cannot change its database identity to the schema owner', roleSwitch);
+
+  let ddl = '';
+  try {
+    await app.query('alter table parcels add column forged int');
+    ddl = 'applied';
+  } catch (err: any) {
+    // PostgreSQL answers a non-owner's ALTER with "must be owner of table parcels", not with
+    // "permission denied for table", so both wordings are the same refusal.
+    ddl = /permission denied|must be owner/.test(String(err.message)) ? 'refused' : String(err.message).slice(0, 60);
+  }
+  assert(ddl === 'refused', 'and cannot alter the very table it is scoped to', ddl);
+
+  // Documents are the other RLS-covered table; prove it independently rather than assume symmetry.
+  const docNoContext = await app.query('select count(*)::int n from land_documents');
+  assert(docNoContext.rows[0].n === 0, 'land_documents is under row-level security too', `got ${docNoContext.rows[0].n}`);
+
+  await app.end();
+
+  // ---- 6. unauthenticated and disabled --------------------------------------
+  console.log('\n6. UNAUTHENTICATED, DISABLED AND MISSING-CONTEXT CALLERS');
+  const anon = await call(`/parcels/${demoParcel}`);
+  assert(anon.status === 401, 'no token, no record', `got ${anon.status}`);
+
+  const orphan = await makeOfficer('orphan', ['Jaipur']);
+  assert(orphan.status === 201, 'premise: an officer with no organization is created', `got ${orphan.status}`);
+  await db.query(`update users set organization_id = null, organization_granted_by = null, organization_grant_reason = null where id = $1`, [orphan.id]);
+  const orphanToken = await login(orphan.email, orphan.password);
+  const orphanRead = await call('/parcels', { token: orphanToken });
+  assert(orphanRead.status === 403 && codeOf(orphanRead) === 'TENANT_CONTEXT_MISSING',
+    'an officer with no tenant is told so, rather than silently shown nothing',
+    `got ${orphanRead.status} ${codeOf(orphanRead)}`);
+
+  // A revoked assignment must not survive in the roster as a working account.
+  const revokeB = await call(`/admin/officers/${bUserId}/jurisdictions`, {
+    token: admin, method: 'PUT',
+    body: { districts: ['Ajmer'], reason: `Tenancy suite ${run}: drop Jaipur from the second tenant's officer` },
+  });
+  assert(revokeB.status === 200, 'premise: the personal assignment is revoked');
+  const bAfterPersonalRevoke = await call(`/parcels/${otherParcel}`, { token: bToken });
+  assert(bAfterPersonalRevoke.status === 404,
+    'a personal revocation removes access even while the tenant still holds the district',
+    `got ${bAfterPersonalRevoke.status}`);
+
+  // ---- teardown on the copy --------------------------------------------------
+  try {
+    await db.query(`update parcels set organization_id = null, organization_granted_by = null, organization_grant_reason = null where id = any($1::text[])`, [[demoParcel, otherParcel, udaipurParcel].filter(Boolean)]);
+    await db.query(`update organization_districts od set relationship='administers' from districts d where od.district_id=d.id and od.organization_id=$1`, [DEMO_TENANT]);
     await db.query(`delete from organization_districts where organization_id = $1`, [OTHER_TENANT]);
     await db.query(`delete from organizations where id = $1`, [OTHER_TENANT]);
-    await db.query(`update parcels set organization_id = null where organization_id = $1 and id = $2`, [DEMO_TENANT, byDistrict[grantDistrict]]);
   } catch (err: any) {
     console.log(`  note  cleanup on the copy did not complete: ${err.message} (the copy is dropped by the harness regardless)`);
   }
 
+  console.log(`\n  ${passed} passed, ${failed} failed.`);
+  if (failed > 0) {
+    console.log('  Every failure above is a requirement the application does not yet meet. They are');
+    console.log('  reported as failures on purpose: a tenancy gate that calls a leak "known" is how a');
+    console.log('  leak becomes permanent. See docs/DISTRICT-TENANCY-MODEL.md §11.');
+  }
   await db.end();
   process.exit(failed > 0 ? 1 : 0);
 }

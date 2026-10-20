@@ -281,6 +281,10 @@ authRouter.get('/me', authenticateToken, async (req: Request, res: Response) => 
         district: tokenUser.district,
         districts: req.principal?.districts ?? [tokenUser.district].filter(Boolean),
         capabilities: req.principal?.capabilities ?? [],
+        // Read from the live principal, never from the token and never from the request: an officer who
+        // belongs to no organization has to be able to see that, because the alternative is an empty
+        // register with no explanation.
+        organizationId: req.principal?.organizationId ?? null,
         designation: userProfile?.designation || tokenUser.role,
         jurisdiction: userProfile?.jurisdiction || `${tokenUser.district} District`,
         state: userProfile?.state || 'Rajasthan',

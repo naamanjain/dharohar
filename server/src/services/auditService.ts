@@ -9,6 +9,8 @@ import { PoolClient } from 'pg';
 import { pool, getDbHealth, memoryStore } from '../db/db';
 import { computeAuditEntryHash, GENESIS_AUDIT_HASH } from '../utils/crypto';
 import { AuditLogEntry } from '../types/backend';
+import { withTenant } from '../db/tenant';
+import type { RequestPrincipal } from './jurisdiction';
 
 export interface CreateAuditLogParams {
   parcelId?: string | null;
@@ -18,6 +20,17 @@ export interface CreateAuditLogParams {
   actionType: string;
   performedBy: string;
   officerBadge?: string;
+  /**
+   * Who performed the action, as the server knows it. Written into `actor_user_id` /
+   * `actor_organization_id` by migration 0008 so that an entry about an ACCOUNT — a reset, a grant, a
+   * declaration — can be attributed to a tenant without reading a display name or a nullable badge
+   * back. Never taken from a request body.
+   *
+   * Both fields are optional because not every actor is an officer: the owner-side disposition command
+   * has an organization and no user, and an entry with no actor at all stays attributable only through
+   * the record it describes.
+   */
+  actor?: { userId?: string | null; organizationId?: string | null } | null;
   details?: Record<string, any>;
   signatureHash?: string;
   createdAt?: string;
@@ -43,8 +56,8 @@ async function appendToChain(client: PoolClient, params: Required<Pick<CreateAud
     `INSERT INTO append_only_audit_logs (
       parcel_id, document_id, entity_type, entity_id, action_type,
       performed_by, officer_badge, details, previous_hash, entry_hash,
-      signature_hash, created_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      signature_hash, created_at, actor_user_id, actor_organization_id
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
     RETURNING id`,
     [
       params.parcelId || null,
@@ -59,6 +72,10 @@ async function appendToChain(client: PoolClient, params: Required<Pick<CreateAud
       entryHash,
       params.signatureHash || null,
       timestamp,
+      // Not part of entry_hash: the chain covers previousHash:entityId:actionType:performedBy:
+      // timestamp:detailsHash, so attributing an entry after the fact cannot rewrite history.
+      params.actor?.userId ?? null,
+      params.actor?.organizationId ?? null,
     ]
   );
 
@@ -159,6 +176,13 @@ export async function recordAuditLog(
  * Fetch chronological audit logs for a parcel or all entities
  */
 export async function getAuditLogs(filter?: {
+  /**
+   * The caller. When present, the query runs inside that caller's row-level security context, so the
+   * parcels subquery can only ever name records in their own organization — an entry about another
+   * tenant's parcel drops out of the result rather than needing a column the audit table does not
+   * have. Omitted only by verifyAuditChain(), which has to read the whole chain to judge its integrity.
+   */
+  principal?: RequestPrincipal;
   parcelId?: string;
   entityId?: string;
   /**
@@ -184,8 +208,10 @@ export async function getAuditLogs(filter?: {
 
   if (health.storageMode === 'postgres-postgis') {
     try {
-      const client = await pool.connect();
-      try {
+      // Building the query and running it are separated so the same statement can execute either
+      // inside a tenant transaction (a caller) or on a plain connection (verifyAuditChain, which has
+      // to read every entry to judge the chain and therefore cannot be scoped at all).
+      const run = async (client: PoolClient) => {
         let query = 'SELECT a.* FROM append_only_audit_logs a';
         const params: any[] = [];
         const where: string[] = [];
@@ -196,6 +222,25 @@ export async function getAuditLogs(filter?: {
         } else if (filter?.entityId) {
           params.push(filter.entityId);
           where.push(`a.entity_id = $${params.length}`);
+        }
+
+        const org = filter?.principal?.organizationId;
+        if (org) {
+          // An entry is attributed to a tenant through the record it describes — a parcel by that
+          // parcel's owner — or, when it describes an account rather than land, through the officer who
+          // performed it or the account it was about. Since migration 0008 the actor is a column; the
+          // name/badge/entity matchers are the fallback that keeps the entries written BEFORE 0008
+          // readable, because hiding history would trade one defect for another.
+          params.push(org, org, org, org);
+          where.push(
+            `((a.parcel_id IS NOT NULL AND a.parcel_id IN (SELECT id FROM parcels WHERE organization_id = $${params.length - 3}))` +
+            ` OR (a.actor_organization_id = $${params.length - 2})` +
+            ` OR (a.entity_id IN (SELECT id FROM users WHERE organization_id = $${params.length - 1}))` +
+            ` OR (a.parcel_id IS NULL AND (` +
+            `      a.officer_badge IN (SELECT badge_number FROM users WHERE organization_id = $${params.length} AND badge_number IS NOT NULL)` +
+            `      OR a.performed_by IN (SELECT display_name FROM users WHERE organization_id = $${params.length})))` +
+            `)`
+          );
         }
 
         if (filter?.districts) {
@@ -230,8 +275,14 @@ export async function getAuditLogs(filter?: {
           signatureHash: row.signature_hash,
           createdAt: row.created_at,
         }));
+      };
+
+      if (filter?.principal) return await withTenant(filter.principal, run);
+      const plain = await pool.connect();
+      try {
+        return await run(plain);
       } finally {
-        client.release();
+        plain.release();
       }
     } catch (err: any) {
       console.error('[AUDIT SERVICE] DB fetch error:', err.message);

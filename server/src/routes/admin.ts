@@ -14,7 +14,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { ProvisioningRejected, createOfficer, listOfficers, resetOfficerPassword, setOfficerCapabilities, setOfficerJurisdictions, setOfficerRole } from '../services/provisioning';
-import { RegistryRejected, declareDistrict, listDistricts, setDistrictActive } from '../services/districtRegistry';
+import { RegistryRejected, declareDistrict, listDistricts, promoteDistrict, setDistrictActive } from '../services/districtRegistry';
 import { districtRefusal, mayProvisionOfficers } from '../services/jurisdiction';
 
 export const adminRouter = Router();
@@ -87,7 +87,6 @@ adminRouter.post('/officers', async (req: Request, res: Response) => {
         capabilities: body.capabilities,
         password: body.password,
         state: body.state,
-        organizationId: body.organizationId,
       },
       req.principal!
     );
@@ -150,9 +149,9 @@ adminRouter.post('/officers/:id/password-reset', async (req: Request, res: Respo
 });
 
 // GET /api/admin/districts — the registry with the counts an operator needs before retiring one.
-adminRouter.get('/districts', async (_req: Request, res: Response) => {
+adminRouter.get('/districts', async (req: Request, res: Response) => {
   try {
-    const districts = await listDistricts();
+    const districts = await listDistricts(req.principal!);
     return res.json({ success: true, data: { total: districts.length, districts } });
   } catch (err) {
     return respondFailure(res, err);
@@ -165,16 +164,33 @@ adminRouter.get('/districts', async (_req: Request, res: Response) => {
 adminRouter.post('/districts', async (req: Request, res: Response) => {
   const body = req.body ?? {};
   try {
-    const { district, created } = await declareDistrict(
-      { name: body.name, organizationId: body.organizationId },
+    const { district, created, granted } = await declareDistrict(
+      { name: body.name, organizationId: body.organizationId, relationship: body.relationship },
       req.principal!
     );
     return res.status(created ? 201 : 200).json({
       success: true,
       data: { district },
       message: created
-        ? `District "${district.name}" declared as ${district.code}. Records can now be filed under it.`
+        ? `District "${district.name}" declared as ${district.code}. It is ${district.kind} geography until an administrator promotes it, and ${granted ? 'your organization may now work in it' : 'not yet granted to your organization'}. Records can now be filed under it.`
         : `District "${district.name}" was already registered; nothing changed. Renaming a district is a separate decision from creating one.`,
+    });
+  } catch (err) {
+    return respondFailure(res, err);
+  }
+});
+
+// POST /api/admin/districts/:code/promote — decide that a candidate district IS canonical geography.
+// Migration 0007 stopped a declaration from meaning that by default, so the claim now needs a named
+// actor, a written reason and an audit entry. Retired fixtures are refused, not rescued.
+adminRouter.post('/districts/:code/promote', async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  try {
+    const change = await promoteDistrict(req.params.code, body.reason, req.principal!);
+    return res.json({
+      success: true,
+      data: change,
+      message: `District ${change.district.code} is now canonical geography, on the record and with the reason written down.`,
     });
   } catch (err) {
     return respondFailure(res, err);

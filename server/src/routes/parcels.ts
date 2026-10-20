@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { PoolClient } from 'pg';
 import { pool, getDbHealth, memoryStore } from '../db/db';
+import { beginTenantTransaction, tenantQuery } from '../db/tenant';
 import { authenticateToken, requireRole } from '../middleware/auth';
 import { validateParcel, calculateGeodesicAreaHectares } from '../services/validationService';
 import { recordAuditLog, getAuditLogs } from '../services/auditService';
@@ -16,10 +17,12 @@ import {
 } from '../services/parcelService';
 import {
   OutOfJurisdiction,
+  TenantContextMissing,
   assertDocumentReadable,
   assertParcelReadable,
   assertParcelWritable,
   assertWritableDistrict,
+  authorizationErrorResponse,
   districtRefusal,
   intersectReadScope,
   isReadOnlyRole,
@@ -61,6 +64,10 @@ function notFound(res: Response, id: string) {
 }
 
 function scopeFailure(res: Response, err: any, id: string, what: string) {
+  // A caller with no organization is told so; a record in someone else's tenant is not. The first is
+  // a configuration an administrator can fix, the second must stay indistinguishable from absence.
+  const tenantRefusal = authorizationErrorResponse(err);
+  if (tenantRefusal) return res.status(tenantRefusal.status).json(tenantRefusal.body);
   if (err instanceof OutOfJurisdiction) return notFound(res, id);
   console.error(`[PARCELS] ${what} check failed:`, err.message);
   return res.status(503).json({
@@ -195,6 +202,8 @@ function mapParcelRow(row: any) {
 }
 
 function respondWriteError(res: Response, err: any, what: string, parcelId = '') {
+  const tenantRefusal = authorizationErrorResponse(err);
+  if (tenantRefusal) return res.status(tenantRefusal.status).json(tenantRefusal.body);
   if (err instanceof OutOfJurisdiction) {
     return notFound(res, parcelId);
   }
@@ -265,6 +274,11 @@ parcelsRouter.get('/', authenticateToken, async (req: Request, res: Response) =>
 
   if (health.storageMode === 'postgres-postgis') {
     try {
+      // A caller with no organization cannot be tenant-scoped, and an empty 200 would look like an
+      // empty register rather than like a misconfiguration. Say which it is, before querying.
+      if (!req.principal!.organizationId) {
+        return res.status(403).json(authorizationErrorResponse(new TenantContextMissing())!.body);
+      }
       // Scoping happens in SQL, not after fetching: filtering the array afterwards would still
       // read every district's rows out of the database on each request.
       const scope = parcelScopeClause(req.principal!, 'p', 1);
@@ -283,7 +297,7 @@ parcelsRouter.get('/', authenticateToken, async (req: Request, res: Response) =>
            GROUP BY p.id
            ORDER BY p.created_at DESC`;
 
-      const result = await pool.query(query, queryParams);
+      const result = await tenantQuery(req.principal!, query, queryParams);
       parcelsList = result.rows.map(mapParcelRow);
     } catch (err: any) {
       console.error('[PARCELS] PostgreSQL fetch error:', err.message);
@@ -382,7 +396,7 @@ parcelsRouter.get('/:id', authenticateToken, requireParcelRead, async (req: Requ
 
   if (health.storageMode === 'postgres-postgis') {
     try {
-      const result = await pool.query(
+      const result = await tenantQuery(req.principal!,
         `${PARCEL_SELECT}
          WHERE p.id = $1
          GROUP BY p.id`,
@@ -424,7 +438,7 @@ parcelsRouter.get('/:id', authenticateToken, requireParcelRead, async (req: Requ
     console.error('[PARCELS] inspection read failed:', err.message);
     inspections = [];
   }
-  auditHistory = await getAuditLogs({ parcelId: id });
+  auditHistory = await getAuditLogs({ parcelId: id, principal: req.principal! });
 
   return res.json({
     success: true,
@@ -531,8 +545,7 @@ parcelsRouter.post(
   if (health.storageMode === 'postgres-postgis') {
     let client: PoolClient | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(officer);
 
       const clash = await client.query('SELECT id FROM parcels WHERE id = $1', [id]);
       if (clash.rows.length > 0) {
@@ -549,8 +562,10 @@ parcelsRouter.post(
           id, khasra_no, khata_no, khewat_no, patwar_circle, district, tehsil, village,
           mapped_area_ha, recorded_area_ha, colour, owner_name, land_type,
           inheritance, document_id, document_name, document_type, document_uploaded_at,
-          document_display_id, document_uri, status, ulpin_status, is_archived, geom, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, ST_GeomFromText($24, 4326), $25)`,
+          document_display_id, document_uri, status, ulpin_status, is_archived, geom, created_at,
+          organization_id, organization_granted_by, organization_grant_reason, organization_granted_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, ST_GeomFromText($24, 4326), $25,
+          $26, $27, $28, NOW())`,
         [
           newParcel.id, newParcel.khasraNo, newParcel.khataNo, newParcel.khewatNo,
           newParcel.patwarCircle, newParcel.district, newParcel.tehsil, newParcel.village,
@@ -559,7 +574,11 @@ parcelsRouter.post(
           newParcel.documentId || null, newParcel.documentName || null, newParcel.documentType || null,
           newParcel.documentUploadedAt || null, newParcel.documentDisplayId || null,
           newParcel.documentUri || null, newParcel.status, newParcel.ulpinStatus, false,
-          wkt, newParcel.createdAt
+          wkt, newParcel.createdAt,
+          // assertWritableDistrict already refused a caller with no organization, so this cannot be
+          // null. Writing it explicitly is what makes the new row visible to the tenant that made it.
+          officer.organizationId, `officer:${officer.email}`,
+          `Registered through the API by ${officer.displayName} (${officer.badgeNumber}).`
         ]
       );
 
@@ -692,8 +711,7 @@ const updateParcelHandler = async (req: Request, res: Response) => {
   if (health.storageMode === 'postgres-postgis') {
     let client: PoolClient | null = null;
     try {
-      client = await pool.connect();
-      await client.query('BEGIN');
+      client = await beginTenantTransaction(officer);
 
       const checkRes = await client.query('SELECT * FROM parcels WHERE id = $1 FOR UPDATE', [id]);
       if (checkRes.rows.length === 0) {
@@ -822,7 +840,7 @@ parcelsRouter.post('/:id/validate', authenticateToken, denyReadOnly, requireParc
   const validator = req.principal!.displayName;
 
   try {
-    const result = await validateParcel(id, validator);
+    const result = await validateParcel(id, req.principal!, validator);
 
     await recordAuditLog({
       parcelId: id,
@@ -863,7 +881,7 @@ parcelsRouter.get('/:id/documents', authenticateToken, requireParcelRead, async 
 
   if (health.storageMode === 'postgres-postgis') {
     try {
-      const result = await pool.query(
+      const result = await tenantQuery(req.principal!,
         'SELECT * FROM land_documents WHERE parcel_id = $1 ORDER BY uploaded_at DESC',
         [id]
       );
@@ -932,6 +950,7 @@ parcelsRouter.post(
         performedBy: officer.displayName,
         officerBadge: officer.badgeNumber,
         defaultDistrict: officer.primaryDistrict || officer.districts[0],
+        principal: officer,
       });
 
       return res.status(201).json({
@@ -1029,7 +1048,7 @@ parcelsRouter.post(
 // GET /api/parcels/:id/audit - Get chronological audit trail for parcel
 parcelsRouter.get('/:id/audit', authenticateToken, requireParcelRead, async (req: Request, res: Response) => {
   const { id } = req.params;
-  const logs = await getAuditLogs({ parcelId: id });
+  const logs = await getAuditLogs({ parcelId: id, principal: req.principal! });
 
   return res.json({
     success: true,
@@ -1124,8 +1143,7 @@ parcelsRouter.delete(
     if (health.storageMode === 'postgres-postgis') {
       let client: PoolClient | null = null;
       try {
-        client = await pool.connect();
-        await client.query('BEGIN');
+        client = await beginTenantTransaction(officer);
 
         const target = await client.query('SELECT id, status FROM parcels WHERE id = $1 FOR UPDATE', [id]);
         if (target.rows.length === 0) {

@@ -182,8 +182,12 @@ WHO="$(docker exec $SCRATCH psql -U postgres -tA -c "select string_agg(distinct 
 chk "the temporary API runs as the least-privilege role" "$APP_USER" "$WHO"
 
 echo "  bootstrapping the copy's administrator through the API container"
+# BOOTSTRAP_ORG_ID attaches the new administrator to the tenant 0004 created and 0006 recorded.
+# Without it the account holds USER_ADMIN but no organization — which is the correct fail-closed state
+# for a tenant-less identity, and useless for exercising reads.
 docker exec -e BOOTSTRAP_ADMIN_EMAIL="$COPY_ADMIN_EMAIL" -e BOOTSTRAP_ADMIN_NAME="Copy Suite Sysadmin" \
   -e BOOTSTRAP_ADMIN_DISTRICT="Jaipur" -e BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PW" \
+  -e BOOTSTRAP_ORG_ID="ORG-DHAROHAR-DEMO" \
   "$API_NAME" node dist-server/db/bootstrapAdmin.js >/tmp/auth-bootstrap.log 2>&1
 chk "bootstrap created an administrator on the copy" "0" "$?"
 grep -iE 'officer|role|district|created' /tmp/auth-bootstrap.log | grep -viE 'password|secret|hash' | head -5 | sed 's/^/    /'
@@ -193,6 +197,19 @@ export TEST_BASE_URL="http://127.0.0.1:${API_PORT}/api"
 export ADMIN_EMAIL="$COPY_ADMIN_EMAIL" ADMIN_PASSWORD="$ADMIN_PW"
 export REGISTRY_ADMIN_URL="postgres://postgres:$SCRATCH_PW@127.0.0.1:55432/postgres"
 export TENANCY_DB_URL="postgres://postgres:$SCRATCH_PW@127.0.0.1:55432/$COPY_DB"
+# The application role's own connection string. The tenancy suite must probe row-level security through
+# the identity the API really uses, not through the superuser that owns the copy — a policy verified
+# as postgres is a policy that has not been tested.
+export TENANCY_APP_URL="postgres://$APP_USER:$APP_PW@127.0.0.1:55432/$COPY_DB"
+
+echo ""
+echo "== row-level security on the copy =="
+chk "policies exist on both root record tables" "8" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_policies where tablename in ('parcels','land_documents')")"
+chk "both root tables are under row-level security" "2" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_class where relname in ('parcels','land_documents') and relrowsecurity")"
+BARE_ROWS="$(docker exec -i -e PGPASSWORD="$APP_PW" $SCRATCH psql -U "$APP_USER" -d "$COPY_DB" -tA -c "select count(*) from parcels" 2>&1 | tail -1)"
+# The whole point of the second layer: a query that never bound a tenant sees nothing, rather than
+# seeing everything because some application code forgot a predicate.
+chk "the runtime role with no tenant context reads zero parcels" "0" "$BARE_ROWS"
 
 run_suite "jurisdiction" server/src/test_jurisdiction_suite.ts
 run_suite "provisioning" server/src/test_provisioning_suite.ts

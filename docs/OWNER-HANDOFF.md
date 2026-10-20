@@ -206,6 +206,10 @@ docker compose -f docker-compose.prod.yml --profile tools run --rm \
 - Set `BOOTSTRAP_ADMIN_PASSWORD` in your shell first (`read -rs` prompts for it without echoing) so the
   password never appears in the command line or your history. If you leave it unset, one is generated
   and printed **once** — copy it immediately; it is not stored anywhere readable.
+- Since migration 0006, also pass `-e BOOTSTRAP_ORG_ID=ORG-DHAROHAR-DEMO` (or `BOOTSTRAP_ORG_NAME` to
+  mint a new tenant). An administrator **with no organization** is a real state, not a mistake to ignore:
+  it can still create officers, and it can read no record at all — the API answers
+  `403 TENANT_CONTEXT_MISSING` rather than showing you an empty register and letting you wonder.
 - After this, every further officer is created through the API's provisioning endpoint
   (`POST /api/admin/officers`) by that administrator. There is no self-signup, and there is no admin
   web page yet — that is a known open item, not a missing step on your side.
@@ -249,6 +253,14 @@ cd /var/backups/dharohar && sha256sum -c dharohar_dharohar_<stamp>.dump.sha256
 # Copy it off the machine, encrypted. A dump on the same disk is not a backup:
 rclone copy /var/backups/dharohar "remote:dharohar-backups" --checksum
 
+# Prove the whole chain in one command — dump, checksum sidecar, copy to a second location, restore
+# FROM THAT COPY into a throwaway database, then compare record counts, a document's payload digest and
+# the hash of the entire audit chain between the live database and the restored one:
+./scripts/offsite-copy-drill.sh --dest /var/backups/offsite-dharohar
+# Point --dest at an rclone mount or a second server for the off-machine claim to be true. On a second
+# volume of the same laptop the drill proves the procedure and the archive's portability, and the script
+# says so in its own output rather than letting you infer more than it tested.
+
 # Restore-test into a NEW empty database. Never over the working one — the script refuses unless you
 # pass --allow-non-empty, and you must never pass that flag against live records:
 ./scripts/restore.sh --container <pg-container> --dbname restore_test_$(date +%s) --create-db \
@@ -270,28 +282,30 @@ and restored copy, and the audit chain verified through the API as valid across 
 
 ## 9. What only you (or the department) can decide
 
-1. **Which organization each record belongs to — this is now the blocking one.** Migrations 0004 and
-   0005 have been applied: the district identifier is the primary key, `organization_districts` is the
-   explicit relationship, Ajmer/Jaipur/Jodhpur/Udaipur carry `state_code='RJ'` as a demo-environment
-   mapping, and all 12 `probe %` fixtures are retired with their parcels kept as isolated synthetic
-   history. What still has no owner is the record itself. Measured on the deployed demo database on
-   2026-10-20: `organization_id` is NULL on **39 of 39 parcels** and **59 of 59 users**, and
-   `land_documents` has no `organization_id` column at all. Until that is decided, a tenant policy has
-   nothing to filter on and the cross-organization leak in the next item cannot be closed by RLS.
-   The decision is: inherit the tenant that administers the parcel's district, or label records by
-   hand. `docs/DISTRICT-TENANCY-MODEL.md` §8 holds the options.
-2. **Tenant enforcement is not implemented, and it is now measured.** An officer belonging to a second
-   organization, personally granted the same district, reads another organization's parcel with
-   **HTTP 200**, and the record appears in that district's listing. That is the result of
-   `server/src/test_tenancy_isolation_suite.ts` (17 passed / 4 failed against a disposable copy), which
-   is expected to stay red until the application consults `organizations` at all — today it authorizes
-   only from `user_jurisdictions`. Do not add two real organizations to one database before this is
-   green.
-3. **A declared district is a canonical district by default.** `districts.kind` defaults to
-   `'canonical'`, so every declaration — including the ones the test suites make — arrives as
-   geography. That is how `probe 790279` got into the registry. The validation gate re-applies your
-   standing retirement decision on each run, but choosing what a *new* declaration means (candidate
-   until approved?) is a governance decision, not a script's.
+1. **Whether the demo-environment ownership assignment is accepted.** Migrations 0006–0008 are applied to
+   the demo deployment (ledger `0001…0008`) and tenant isolation is enforced in the application and by
+   PostgreSQL row-level security — the cross-tenant read that used to answer HTTP 200 now answers 404,
+   measured. What 0006 did is a stated inference, not evidence about land: it assigned records in the four
+   canonical districts to `ORG-DHAROHAR-DEMO` because this database has only ever been the synthetic demo
+   environment and that is the only tenant it has had. It refused to assign anything else: **12 parcels
+   and 2 documents are quarantined** (`organization_id IS NULL`), invisible to every tenant, preserved in
+   the database. Read `docs/DISTRICT-TENANCY-MODEL.md` §11 and decide (a) whether you accept that
+   assignment for the demo tenant, and (b) what to do with the quarantined rows. The disposition path is
+   `docker compose -f docker-compose.prod.yml --profile tools run --rm -e ASSIGN_TABLE=parcels
+   -e ASSIGN_IDS=… -e ASSIGN_ORGANIZATION=… -e ASSIGN_BY=… -e ASSIGN_REASON=… maint
+   dist-server/db/assignOwnership.js`; it refuses a missing reason, an unknown id and any move between
+   two tenants unless `ASSIGN_TAKEOVER=true` is passed.
+2. **Adding a second organization is now a live configuration decision, not a schema one.** The isolation
+   tests in `server/src/test_tenancy_isolation_suite.ts` create a second tenant on a disposable copy and
+   assert that each side sees only its own records in a district both hold (42 checks, all green with
+   `./scripts/test-authorization-on-copy.sh`). Before you create a real tenant against real records,
+   decide who may create organizations and who signs off on a district grant: today only the schema-owner
+   one-shots and the declaring officer's own tenant can create them, and there is no approval workflow.
+3. **Who may promote a declared district to canonical geography.** Fixed as of migration 0007: a
+   declaration lands as `candidate` and only `POST /api/admin/districts/:code/promote` — `USER_ADMIN`,
+   a reason of at least 10 characters, an audit entry, and a refusal to rescue a retired fixture — makes
+   it canonical. What is still yours to decide is the approval rule around that: today any officer
+   holding `USER_ADMIN` inside a tenant can promote a district, and nothing requires a second person.
 4. **The real district list.** Everything in the registry today was derived from values the demo data
    already contained. Declare the actual ones (`POST /api/admin/districts`) before treating any clean
    integrity report as authoritative.
@@ -318,13 +332,24 @@ Do not read this document as a claim that these were tested. They were not:
   no load test was performed.
 * **Real record volumes.** Every measurement in this document is on synthetic demo data — 39 parcels,
   59 accounts.
-* **Row-level security.** Not implemented, and per-district isolation is the only layer that exists.
-  The cross-organization behaviour that is missing is measured in item 2 above, not assumed.
-* **Restore from the off-machine copy.** The local restore drill passed; fetching an encrypted dump from
-  a second location and restoring that has not been done, because no off-machine copy exists yet.
+* **Row-level security: implemented on two tables, and only those.** `parcels` and `land_documents`
+  carry four tenant policies each and are verified as `dharohar_app` (no context → zero rows; forged
+  context → zero rows; `SET ROLE` refused). Nested tables (`parcel_owners`, `parcel_mutations`,
+  `field_inspections`, `user_jurisdictions`) have no policies of their own and are scoped through their
+  parcel; `users` has none because login must resolve the account before a tenant exists;
+  `append_only_audit_logs` has none because entries are scoped through the record they describe and
+  chain verification is whole-table by nature. That boundary is `docs/SECURITY.md` item 7, not a claim
+  that every table is covered.
+* **A copy on another machine.** `./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups` passed end
+  to end — dump, checksum, copy to a second volume, restore from that copy, payload digest and audit
+  chain compared — but D: is a different volume on the same physical laptop, and the archive is not
+  encrypted. `rclone`/B2/R2 with `--checksum` has not been executed, so "a copy exists outside this
+  machine" is still not true.
 
 Everything claimed as *done* in this document is backed by a command in `docs/DEPLOYMENT.md` §9 or by the
-validation gate (`./scripts/validate-stack.sh` — **52 passed, 1 failed** on 2026-10-20, the one failure
+validation gate (`./scripts/validate-stack.sh` — **66 passed, 1 failed** on 2026-10-21, the one failure
 being that provisioning was not run against the live stack because no administrator password was
 exported; it ran green against a disposable copy), and by `./scripts/test-tenant-migration.sh`
-(**65 passed, 0 failed**) and `./scripts/test-authorization-on-copy.sh`.
+(**117 passed, 0 failed**, covering migrations 0004–0008 with rollback guards) and
+`./scripts/test-authorization-on-copy.sh` (jurisdiction 46/0, provisioning 91/0, tenancy 42/0 against a
+copy with the API running as `dharohar_app`).

@@ -11,6 +11,8 @@
 
 import { ParcelValidationResult, ValidationCheckItem } from '../types/backend';
 import { memoryStore, getDbHealth, pool } from '../db/db';
+import { withTenant } from '../db/tenant';
+import type { RequestPrincipal } from './jurisdiction';
 
 export function calculateGeodesicAreaHectares(pts: Array<{ lat: number; lng: number }>): number {
   if (!pts || pts.length < 3) return 0;
@@ -28,7 +30,11 @@ export function calculateGeodesicAreaHectares(pts: Array<{ lat: number; lng: num
 /**
  * Validate a parcel against authoritative cadastral and legal rules
  */
-export async function validateParcel(parcelId: string, validatedBy = 'System Validator'): Promise<ParcelValidationResult> {
+export async function validateParcel(
+  parcelId: string,
+  officer: RequestPrincipal,
+  validatedBy = 'System Validator'
+): Promise<ParcelValidationResult> {
   const health = getDbHealth();
   let parcel: any = null;
   let owners: any[] = [];
@@ -36,8 +42,10 @@ export async function validateParcel(parcelId: string, validatedBy = 'System Val
   let documents: any[] = [];
 
   if (health.storageMode === 'postgres-postgis') {
-    const client = await pool.connect();
-    try {
+    // Read through the caller's tenant: the parcel, its owners, its inspections and its documents are
+    // one record's worth of evidence and must all come from the same organization. Without row-level
+    // security applied here, a validation report could quote another tenant's document hash.
+    await withTenant(officer, async (client) => {
       const pRes = await client.query('SELECT * FROM parcels WHERE id = $1', [parcelId]);
       if (pRes.rows.length > 0) {
         const row = pRes.rows[0];
@@ -75,9 +83,7 @@ export async function validateParcel(parcelId: string, validatedBy = 'System Val
 
       const dRes = await client.query('SELECT * FROM land_documents WHERE parcel_id = $1', [parcelId]);
       documents = dRes.rows;
-    } finally {
-      client.release();
-    }
+    });
 
     // Previously a query error dropped validation onto the in-memory demo parcels, so a
     // database outage could still return "canBeVerified: true" for a record it never read.

@@ -7,15 +7,20 @@ import { sha256 } from '../utils/crypto';
 import { mapDocumentRow, normaliseOwner, setDocumentParcelLink } from '../services/parcelService';
 import {
   OutOfJurisdiction,
+  TenantContextMissing,
   assertDocumentReadable,
   assertDocumentWritable,
   assertParcelWritable,
   assertWritableDistrict,
+  authorizationErrorResponse,
+  DEV_TENANT_ORGANIZATION,
   districtRefusal,
   logStateWideRead,
+  organizationScopeClause,
   parcelDistrict,
   readScope,
 } from '../services/jurisdiction';
+import { beginTenantTransaction, tenantQuery } from '../db/tenant';
 
 export const documentsRouter = Router();
 
@@ -63,7 +68,17 @@ documentsRouter.get('/', authenticateToken, async (req: Request, res: Response) 
         );
       }
 
-      const result = await pool.query(
+      // Tenancy is a second, independent predicate: two organizations may both be granted a district
+      // by organization_districts, and that grant must not put the other tenant's uploads in this
+      // list. Unowned (quarantined) rows fail the equality and are excluded by construction.
+      const tenant = organizationScopeClause(req.principal!, 'd', params.length + 1);
+      if (tenant.sql.startsWith(' AND (1 = 0)')) {
+        return res.status(403).json(authorizationErrorResponse(new TenantContextMissing())!.body);
+      }
+      params.push(...tenant.params);
+      where.push(tenant.sql.trim().replace(/^AND /, ''));
+
+      const result = await tenantQuery(req.principal!,
         `SELECT d.* FROM land_documents d
            LEFT JOIN parcels p ON p.id = d.parcel_id
            ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
@@ -90,6 +105,10 @@ documentsRouter.get('/', authenticateToken, async (req: Request, res: Response) 
   }
 
   let documents = Array.from(memoryStore.documents.values());
+  // No tenant filter here, and that is deliberate rather than an oversight: the in-memory store holds
+  // one environment's fixtures and loadPrincipal gives every persona DEV_TENANT_ORGANIZATION, so there
+  // is no second tenant to be separated from. Tenant isolation is proven against PostgreSQL, where the
+  // quarantine case and row-level security actually exist.
   if (parcelId) {
     documents = documents.filter((d) => d.parcelId === parcelId);
   }
@@ -117,7 +136,7 @@ documentsRouter.get('/:id', authenticateToken, async (req: Request, res: Respons
 
   if (health.storageMode === 'postgres-postgis') {
     try {
-      const result = await pool.query('SELECT * FROM land_documents WHERE id = $1', [id]);
+      const result = await tenantQuery(req.principal!, 'SELECT * FROM land_documents WHERE id = $1', [id]);
       if (result.rows.length === 0) {
         return res.status(404).json({
           success: false,
@@ -129,6 +148,8 @@ documentsRouter.get('/:id', authenticateToken, async (req: Request, res: Respons
       try {
         await assertDocumentReadable(req.principal!, document);
       } catch (err) {
+        const tenantRefusal = authorizationErrorResponse(err);
+        if (tenantRefusal) return res.status(tenantRefusal.status).json(tenantRefusal.body);
         if (err instanceof OutOfJurisdiction) {
           return res.status(404).json({
             success: false,
@@ -139,7 +160,16 @@ documentsRouter.get('/:id', authenticateToken, async (req: Request, res: Respons
       }
       let linkedParcelOwners: any[] = [];
       if (document.parcelId) {
-        const owners = await pool.query('SELECT * FROM parcel_owners WHERE parcel_id = $1', [document.parcelId]);
+        // Joined through parcels rather than read straight off parcel_owners: parcel_owners carries
+        // no owner column of its own (its tenant is the parcel's), and the row-level policy on parcels
+        // is what makes a link into another organization's record unreadable here. A document that
+        // predates its parcel's assignment therefore cannot leak the parcel's owners.
+        const owners = await tenantQuery(req.principal!,
+          `SELECT o.* FROM parcel_owners o
+             JOIN parcels p ON p.id = o.parcel_id
+            WHERE o.parcel_id = $1`,
+          [document.parcelId]
+        );
         linkedParcelOwners = owners.rows.map(normaliseOwner);
       }
 
@@ -195,17 +225,21 @@ documentsRouter.post(
     let document: any = null;
     try {
       if (getDbHealth().storageMode === 'postgres-postgis') {
-        const found = await pool.query('SELECT * FROM land_documents WHERE id = $1', [id]);
+        const found = await tenantQuery(principal, 'SELECT * FROM land_documents WHERE id = $1', [id]);
         if (found.rows.length === 0) return notFoundDocument(res, id);
         document = mapDocumentRow(found.rows[0]);
       } else {
-        document = memoryStore.documents.get(id);
-        if (!document) return notFoundDocument(res, id);
+        const memoryDoc = memoryStore.documents.get(id);
+        if (!memoryDoc) return notFoundDocument(res, id);
+        // The fixtures are the development environment's own records, so they are its tenant's.
+        document = { ...memoryDoc, organizationId: DEV_TENANT_ORGANIZATION };
       }
 
       await assertDocumentWritable(principal, document);
       if (parcelId) await assertParcelWritable(principal, parcelId);
     } catch (err) {
+      const tenantRefusal = authorizationErrorResponse(err);
+      if (tenantRefusal) return res.status(tenantRefusal.status).json(tenantRefusal.body);
       if (err instanceof OutOfJurisdiction) return notFoundDocument(res, id);
       const refusal = districtRefusal(err);
       if (refusal) return res.status(400).json({ success: false, error: refusal });
@@ -274,7 +308,7 @@ documentsRouter.post(
     // assignments, at write time rather than left null for a reader to discover.
     const filedDistrict =
       (typeof body.district === 'string' && body.district.trim()) ||
-      (body.parcelId ? await parcelDistrict(body.parcelId) : null) ||
+      (body.parcelId ? await parcelDistrict(officer, body.parcelId) : null) ||
       officer.primaryDistrict ||
       officer.districts[0] ||
       null;
@@ -308,15 +342,18 @@ documentsRouter.post(
     if (health.storageMode === 'postgres-postgis') {
       let client: PoolClient | null = null;
       try {
-        client = await pool.connect();
-        await client.query('BEGIN');
-
+        client = await beginTenantTransaction(officer);
+        // The upload's owner is the uploading officer's organization, taken from the principal the
+        // server built from the database — never from the request body. Attribution columns are
+        // mandatory: migration 0006's CHECK refuses a row that claims an owner without them.
         await client.query(
           `INSERT INTO land_documents (
             id, parcel_id, document_code, file_name, record_type, ocr_language, raw_ocr_text,
             district, tehsil, village, patwar_circle, status, priority, image_uri,
-            quality_metrics, extracted_data, document_hash, ocr_confidence, uploaded_by, uploaded_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20::timestamptz)
+            quality_metrics, extracted_data, document_hash, ocr_confidence, uploaded_by, uploaded_at,
+            organization_id, organization_granted_by, organization_grant_reason, organization_granted_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb, $17, $18, $19, $20::timestamptz,
+            $21, $22, $23, NOW())
           ON CONFLICT (id) DO UPDATE SET
             raw_ocr_text = EXCLUDED.raw_ocr_text,
             extracted_data = EXCLUDED.extracted_data,
@@ -329,6 +366,8 @@ documentsRouter.post(
             newDoc.patwarCircle, newDoc.status, newDoc.priority, newDoc.imageUri,
             JSON.stringify(newDoc.qualityMetrics), JSON.stringify(newDoc.extractedData),
             newDoc.documentHash, newDoc.ocrConfidence, newDoc.uploadedBy, newDoc.uploadedAt,
+            officer.organizationId, `officer:${officer.email}`,
+            `Uploaded through the API by ${officer.displayName} (${officer.badgeNumber}).`,
           ]
         );
 
