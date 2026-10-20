@@ -84,7 +84,7 @@ authenticateToken  →  denyReadOnly  →  requireRole(...)  →  requireParcelS
 
 Proved by `npm run test:jurisdiction` (46 assertions: id substitution, query parameters, alternate
 endpoints, document references, audit reads, foreign-row snapshots before and after) and
-`npm run test:provisioning` (57 assertions covering multi-district grants, immediate revocation,
+`npm run test:provisioning` (91 assertions covering multi-district grants, immediate revocation,
 state-wide read without mutation, the logging of it, the re-homing matrix and password rotation).
 Both run against the containerised stack from `scripts/validate-stack.sh` (T8–T12), and both were also
 run against an API connected as the **least-privilege** `dharohar_app` database role. **Frontend
