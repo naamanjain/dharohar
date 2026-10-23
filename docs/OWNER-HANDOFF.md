@@ -201,15 +201,28 @@ attack surface to defend while the data is still fabricated.
    VM. In Git Bash, from the repository:
    ```bash
    set -a; . ./.env; set +a
-   TEST_BASE_URL=http://127.0.0.1:8088/api DEMO_PASSWORD="$DEMO_PASSWORD" \
-     npx tsx server/src/test_jurisdiction_suite.ts
+   export TEST_BASE_URL=http://127.0.0.1:8088/api
+   read -rs ADMIN_PASSWORD && export ADMIN_PASSWORD       # §6 — the one credential only you have
+   npx tsx server/src/test_jurisdiction_suite.ts          # 46 checks: cross-district access denied
+   npx tsx server/src/test_provisioning_suite.ts          # 91 checks: grants, capabilities, rotation
+   npx tsx server/src/test_tenancy_isolation_suite.ts     # 101 checks: two tenants, one district each
+   ./scripts/validate-stack.sh                            # 69 checks today: 68 pass, 1 = the ADMIN_PASSWORD skip
+   unset ADMIN_PASSWORD
    ```
-   46 checks. Cross-district access must all be denied.
+   The tenancy suite needs `TENANCY_DB_URL` and `TENANCY_APP_URL` as well, which is why the same three
+   suites are also run against a disposable copy by `./scripts/test-authorization-on-copy.sh` — that
+   script is the one that can be run with no operator credentials at all.
+   Retire what the gate created when you are done: `docker compose -f docker-compose.prod.yml exec -T
+   -e RESIDUE_APPLY=true -e RESIDUE_ADMIN_EMAIL=<the administrator's address> api node
+   dist-server/retireSuiteResidue.js`. Since migration 0010 it reads only its own tenant's residue, so
+   a multi-tenant box retires one tenant per administrator (or runs as the owner via `maint`).
 6. Back up on a schedule and get the dump **off the VM** (§8). A staging box with no off-machine copy is
    a machine that will lose its data and its proof at the same time.
 
-What this staging does **not** prove: public reachability, TLS, DNS, the ARM image, capacity under real
-traffic, or anything about tenant isolation. Those are in §9 and in `docs/SECURITY.md` §"open items".
+What this staging does **not** prove: public reachability, TLS, DNS, the ARM image, or capacity under
+real traffic — those are in §9. Tenant isolation is no longer on that list: it is tested, in two layers,
+against a restored copy and against this stack, and the two named residuals are in
+`docs/TENANT-DATA-ACCESS.md` §4b rather than in a footnote.
 
 ---
 
