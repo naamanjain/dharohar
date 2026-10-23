@@ -92,21 +92,29 @@ guess.
    ```
    `.env` is gitignored and `.dockerignore` keeps it out of the images. Never paste these into a
    Dockerfile, compose file, commit, screenshot, chat message or ticket.
-3. There are deliberately **three** database identities now.
+3. There are deliberately **four** database identities now.
    * `dharohar` — the owner. Used only by the one-shot `migrate`, `roleinit` and `maint` containers; the
      API cannot see this password.
    * `dharohar_app` — the runtime role. No DDL, no TRUNCATE, no DELETE on records, subject to row-level
-     security.
+     security, and since migration 0010 it cannot read `users.password_hash` or `users.salt` at all.
    * `dharohar_verifier` — **read-only, and the one you should run the checks with.** It can see every
      row (including other tenants') because integrity checking has to, but it cannot write anything:
      `roles.sql` creates it only when you supply the password, and refuses to finish if any write
      privilege ends up on it. Without it the checks have to run as the owner, which is a credential that
      could rewrite the audit chain.
-4. If a value ever appears in a terminal log, a chat or a commit: rotate it (put a new value in `.env`,
-   run `docker compose -f docker-compose.prod.yml up -d` — `roleinit` reapplies it), then treat the old
-   one as known to whoever saw it. `docker inspect` on a running container prints its environment, so do
-   not pipe that into a log or a ticket; read a specific field with
-   `docker compose -f docker-compose.prod.yml exec api printenv PGUSER` instead.
+   * `dharohar_identity` — **NOLOGIN**, owns only the two functions the login path is allowed to call.
+     Nobody connects as it; if `pg_roles` ever says it can log in, `roles.sql` and migration 0010 both
+     say so and stop.
+4. If a value ever appears in a terminal log, a chat or a commit, rotate `DHAROHAR_APP_PASSWORD` with
+   `./scripts/rotate-app-credential.sh` (see `docs/DEPLOYMENT.md` §4 for what it measures). It edits one
+   line of `.env`, re-runs `roleinit` so PostgreSQL applies the new value to the role, recreates the API,
+   then **proves both directions**: the new credential authenticates and the old one is refused.
+   It prints digests, never values, and puts the old value back if any check fails.
+   Two ways this project has actually leaked a secret, so that the shape of the trap is on the record:
+   `docker inspect` prints a container's whole environment, and `docker compose config` prints every
+   interpolated URL — `postgresql://dharohar_app:<password>@db:5432/dharohar` is one line, so filtering
+   for "lines that look like a variable name" does not redact it. Count **occurrences of the value**;
+   a line that contains a secret is a line that shows it.
 
 ---
 
@@ -249,6 +257,54 @@ docker compose -f docker-compose.prod.yml --profile tools run --rm \
   web page yet — that is a known open item, not a missing step on your side.
 - Confirm you can sign in at the URL with that email and password before you show anyone the system.
 
+### The one stack-gate check that needs you, and why
+
+`scripts/validate-stack.sh` ends with a single check that cannot run without your administrator
+password — line 230: if `ADMIN_PASSWORD` is unset it prints
+
+```
+  FAIL  ADMIN_PASSWORD not exported — provisioning suite not run here.
+```
+
+and that is the only failure in an otherwise complete run (**68 passed, 1 failed** of 69 checks, measured
+2026-10-23 after migration 0010).
+The check is the **provisioning suite against the live stack**: it signs in as the administrator, then
+creates, grants, revokes and retires officers through the real API. Nothing else in the gate can do
+that, because nothing else holds an administrator credential.
+
+Why the password is not in `.env`, stated precisely because "just use DEMO_PASSWORD" is wrong here:
+
+| | |
+| --- | --- |
+| The live administrator | `USR-SYSADM-01`, `sysadmin@dharohar.local`, role `TEHSILDAR`, organization `ORG-DHAROHAR-DEMO`, `badge_number` NULL, created 2026-10-16 |
+| How it was created | the bootstrap one-shot above, taking `BOOTSTRAP_ADMIN_PASSWORD` from the terminal that day |
+| Where that password lives | nowhere on disk. It was never written to `.env`, and the generator that prints one prints it once, to a terminal |
+| What `DEMO_PASSWORD` governs | the **seeded demo personas** only |
+| Are those personas in this database? | no — `select count(*) from users where lower(email)='demo.doe@dharohar.local'` returns **0** of the 59 officers (measured 2026-10-23) |
+| So what happens if you try it | `POST /api/auth/login` for `sysadmin@dharohar.local` with `DEMO_PASSWORD` returns **HTTP 401**, measured the same day |
+
+Two things this project will not do about that, on purpose: it will not run the bootstrap again to
+"reset" the administrator (the script refuses when an administrator already exists — it is an
+introduction, not a back door), and it will not create a second administrator so a test can pass. Both
+would be changing a live register to satisfy a script.
+
+Run it yourself, in a form that leaves no trace in history or in a log:
+
+```bash
+cd <the directory holding docker-compose.prod.yml and .env>
+read -rs ADMIN_PASSWORD && export ADMIN_PASSWORD     # typed, never echoed, never stored in history
+./scripts/validate-stack.sh
+unset ADMIN_PASSWORD
+```
+
+`ADMIN_EMAIL` already defaults to `sysadmin@dharohar.local` (validate-stack.sh:231); set it only if the
+administrator is someone else. Measured state without the password: **68 passed, 1 failed** (69 checks).
+With it, that one failure stops being a skip and the provisioning suite runs against the live stack; I
+have not executed that combination, so the honest expectation is "no failures", not a number I can name
+in advance. If the password is wrong the provisioning suite fails at its own login step — a different
+message from the skip above, which is why they are printed separately. Do not paste the password into a
+chat so an agent can run it: everything else in the gate runs without it.
+
 ---
 
 ## 7. Verify it from outside your own network (you must do this; the laptop cannot)
@@ -284,7 +340,8 @@ PGUSER=dharohar ./scripts/backup.sh --container dharohar-prod-db-1 --dbname dhar
 # bare filename):
 cd /var/backups/dharohar && sha256sum -c dharohar_dharohar_<stamp>.dump.sha256
 
-# Copy it off the machine, encrypted. A dump on the same disk is not a backup:
+# Copy it off the machine, encrypted. A dump on the same disk is not a backup, and a plaintext dump in
+# someone else's bucket is a disclosure:
 rclone copy /var/backups/dharohar "remote:dharohar-backups" --checksum
 
 # Prove the whole chain in one command — dump, checksum sidecar, copy to a second location, restore
@@ -295,11 +352,39 @@ rclone copy /var/backups/dharohar "remote:dharohar-backups" --checksum
 # volume of the same laptop the drill proves the procedure and the archive's portability, and the script
 # says so in its own output rather than letting you infer more than it tested.
 
+# Prove the archive is unreadable without a passphrase, and still restores with one. The passphrase is
+# typed at the prompt, never stored in history, never an argument (an argument would sit in the process
+# list for the length of the run):
+read -rs -p 'passphrase: ' BACKUP_PASSPHRASE && export BACKUP_PASSPHRASE
+./scripts/encrypted-backup-drill.sh
+unset BACKUP_PASSPHRASE
+# Run 2026-10-23: 38 checks, exit 0. It shows pg_restore reading the PLAINTEXT archive's manifest with
+# no key at all and failing on the encrypted one, that a wrong passphrase cannot open it, that the
+# decrypted bytes are identical to the archive, and that the decrypted copy restores with the ledger,
+# the payload digest, the geometry count and the whole audit chain matching the live database.
+
 # Restore-test into a NEW empty database. Never over the working one — the script refuses unless you
 # pass --allow-non-empty, and you must never pass that flag against live records:
 ./scripts/restore.sh --container <pg-container> --dbname restore_test_$(date +%s) --create-db \
   --input /var/backups/dharohar/dharohar_dharohar_<stamp>.dump
 ```
+
+**Read this before you take a backup on the laptop.** `pg_dump`'s custom format is not encrypted, and
+measured on 2026-10-23 it is not opaque either — `pg_restore --list` prints every table it holds without
+a key. This repository sits at `C:\Users\allin\OneDrive\Desktop\AI\DHAROHAR`, and your Desktop known
+folder is redirected into OneDrive, so `backups/` — 69 plaintext dumps at the time of checking — is
+inside a folder that a sync client would upload the moment one signs in. The OneDrive client was not
+running and had no account configured when I measured, so **nothing is proven to have left the machine,
+and nothing can be proven not to have.** Two things follow:
+
+1. `scripts/backup.sh` now says so out loud. When the resolved output directory lies under a cloud-sync
+   path it prints a `WARNING:` naming the directory and pointing at the encrypted drill. It warns and
+   still writes; the warning is the signal, not a lock-out. Verified in both directions — it fires for
+   `backups/` here and stays silent for `C:\temp-dh-backup`.
+2. Take the backup somewhere that is not this tree: `--output D:/dharohar-backups`, or move the
+   repository out of a sync root. Then apply a retention rule (30 days) — accumulation is its own leak.
+
+Full procedure, including what has to be true for the off-machine claim: `docs/DEPLOYMENT.md` §8.
 
 Cron example (2:30 nightly, keep 30 days): see `docs/DEPLOYMENT.md` §8.
 
@@ -383,20 +468,26 @@ Do not read this document as a claim that these were tested. They were not:
   reasonable target but this has not been executed on Arm.
 * **Production capacity / concurrent officers.** The containers are capped at 0.75 vCPU and 512 MB each;
   no load test was performed.
-* **Real record volumes.** Every measurement in this document is on synthetic demo data — 42 parcels
-  (30 owned by the demo tenant, 12 quarantined), 45 documents, 59 accounts, 2,341 audit entries.
-* **Row-level security: five tables, and only those.** `parcels` and `land_documents` carry four tenant
+* **Real record volumes.** Every measurement in this document is on synthetic demo data — 45 parcels
+  (33 owned by the demo tenant, 12 quarantined), 51 documents (2 carrying a real payload, both written
+  by drills), 59 accounts (all owned), 2,874 audit entries (831 carrying an actor organization since
+  0008). These numbers move every time a gate runs against this database; the ratios and the ownership
+  split are the facts, the totals are a snapshot.
+* **Row-level security: nine tables, and only those.** `parcels` and `land_documents` carry four tenant
   policies each (0006); `parcel_owners`, `parcel_mutations` and `field_inspections` carry four each and
-  inherit their parcel's policy (0009). All of it is verified directly as `dharohar_app`: no context →
-  zero rows, forged context → zero rows, cross-tenant child write refused, `SET ROLE` refused. The
-  tables deliberately left without policies are `users`, `user_jurisdictions`, `user_capabilities` and
-  `organization_districts` — login has to read them to discover the tenant, so a tenant-keyed policy
-  would fail every sign-in — plus `districts` (shared geography), `organization_units` (no code reads
-  it) and `append_only_audit_logs` (chain verification is whole-table by nature). The reasoning, the
-  measured privileges and the queries that reproduce all of it are in
-  [docs/TENANT-DATA-ACCESS.md](TENANT-DATA-ACCESS.md). What is *not* verified is whether that boundary
-  is the right one for a department reviewer; it is a documented decision, not a tested requirement.
-* **An administrator password you have not supplied.** `./scripts/validate-stack.sh` runs **67 passed,
+  inherit their parcel's policy (0009); `users`, `user_jurisdictions`, `user_capabilities` and
+  `organization_districts` carry four each, scoped to *own row or own organization* (0010). All of it is
+  verified directly as `dharohar_app`: no context → zero rows, forged context → only the asserted
+  tenant's rows and still zero records, cross-tenant child write refused, `SET ROLE` refused, and since
+  0010 the credential columns unreadable by privilege *and* by attempted select. The tables still left
+  without policies are `districts` (shared geography), `organization_units` (no code reads it) and
+  `append_only_audit_logs` (chain verification is whole-table by nature). The reasoning, the measured
+  privileges and the queries that reproduce all of it are in
+  [docs/TENANT-DATA-ACCESS.md](TENANT-DATA-ACCESS.md) — including §4b, which states the two things layer
+  two does **not** do: a session may assert its own tenant, and the sanctioned login lookup returns one
+  named officer's credential columns. Neither is closed, so tenant isolation is not described as
+  complete anywhere in this repository, and closing the second needs a separate authentication identity.
+* **An administrator password you have not supplied.** `./scripts/validate-stack.sh` runs **68 passed,
   1 failed**, and the one failure is that `ADMIN_PASSWORD` was not exported, so the provisioning suite
   did not run *against this live stack*. The same suite ran **91/0** against a disposable copy where the
   harness bootstraps an administrator of its own (`./scripts/test-authorization-on-copy.sh`), so the
@@ -417,11 +508,14 @@ of 2026-10-24, by one full sweep run against the same build:
 | gate | measured |
 | --- | --- |
 | `./scripts/test-tenant-migration.sh` | **141 passed, 0 failed** (exit 0) — migrations 0004–0009, guards fired on purpose, rollbacks and re-applies |
-| `./scripts/test-fresh-install.sh` | **105 passed, 0 failed** (exit 0) — empty database to full schema, compared with an upgraded one, provisioning checked against the rows it writes, an aborted migration diagnosed and recovered |
-| `./scripts/test-authorization-on-copy.sh` | jurisdiction **46/0**, provisioning **91/0**, tenancy **68/0** (exit 0) |
+| `./scripts/test-fresh-install.sh` | **all checks passed**, exit 0 (106 assertions) — empty database to full schema, compared with an upgraded one, provisioning checked against the rows it writes, an aborted migration diagnosed and recovered |
+| `./scripts/test-authorization-on-copy.sh` | jurisdiction **46/0**, provisioning **91/0**, tenancy **101/0** (exit 0) |
+| `./scripts/test-tenant-migration.sh` | **141 passed, 0 failed**, exit 0 |
+| `npm run test:registry` | **56 passed, 0 failed**, exit 0 |
+| `./scripts/encrypted-backup-drill.sh` | **38 checks**, exit 0 — see §8; the off-machine leg is NOT executed |
 | `./scripts/test-rls-blind-certifier.sh` | all checks passed (exit 0) — the chain certifier refuses a partial read instead of reporting health |
 | `npm run lint`, `npm test` | exit 0 — tsc clean, phase 4 **47/0**, E2E **53/0** |
-| `verify dist-server/verify_audit_chain.js` | exit 0 — 2,341 entries, ids contiguous, **INTACT**, as `dharohar_verifier` |
-| `verify dist-server/verify_district_integrity.js` | exit 1 by design — **58 findings**, all accounted for in `docs/DISTRICT-INTEGRITY-REPORT.md` §6 |
-| `./scripts/validate-stack.sh` | **67 passed, 1 failed** — see the `ADMIN_PASSWORD` bullet above |
+| `verify dist-server/verify_audit_chain.js` | exit 0 — **2,874 entries**, ids contiguous, **INTACT**, as `dharohar_verifier` |
+| `verify dist-server/verify_district_integrity.js` | exit 1 by design — findings all accounted for in `docs/DISTRICT-INTEGRITY-REPORT.md` §6 |
+| `./scripts/validate-stack.sh` | **68 passed, 1 failed** of 69 checks — see the `ADMIN_PASSWORD` bullet above |
 | `./scripts/offsite-copy-drill.sh` | all checks passed (exit 0) — see the same-volume caveat above |

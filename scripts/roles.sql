@@ -82,12 +82,18 @@ DO $do$
 DECLARE
   t          text;
   ops        text[] := ARRAY[
-    'users', 'parcels', 'parcel_owners', 'parcel_mutations',
+    -- 'users' is deliberately NOT here. It is granted column-by-column in section 3c instead, because
+    -- the two credential columns must not be readable by the runtime role. Granting table-level SELECT
+    -- on it here would silently undo migration 0010 on every roleinit run — and roleinit runs on every
+    -- `docker compose up`, so the mistake would be invisible until someone queried a hash.
+    'parcels', 'parcel_owners', 'parcel_mutations',
     'land_documents', 'field_inspections',
     -- From migration 0002: the tenant, the jurisdiction registry, and the two assignment tables the
     -- authorization layer reads on every request. The API must be able to READ these to decide
     -- anything at all, and must be able to WRITE them only through the provisioning service, which
     -- is the same statement path — so they are granted like the operational tables.
+    -- Since migration 0010 the four authorization tables are ALSO row-level-security scoped: these
+    -- grants say which columns the role may touch, the policies say which rows.
     'organizations', 'districts', 'user_jurisdictions', 'user_capabilities',
     -- From migration 0004. loadPrincipal reads organization_districts on EVERY authenticated request,
     -- because a tenant's district authority has to take effect — and be revoked — immediately rather
@@ -96,8 +102,8 @@ DECLARE
     -- organization_units is MEASURED to have no reader or writer anywhere in server/src or client/src,
     -- and zero rows in the deployed database: 0004 reserved the structure for internal units and nothing
     -- uses it yet. It is granted anyway so that a later feature does not fail closed on a missing
-    -- privilege; because it carries organization_id and is NOT under row-level security, whoever gives
-    -- it a query must add the tenant policy in the same change. Neither table is deletable: see 3b.
+    -- privilege; because it carries organization_id, whoever gives it a query must add the tenant
+    -- policy in the same change. Neither table is deletable: see 3b.
     'organization_districts', 'organization_units'
   ];
 BEGIN
@@ -142,6 +148,77 @@ BEGIN
 END
 $do$;
 --
+-- ---- 3c. users: every column EXCEPT the two credentials, plus the lookups ----
+-- Migration 0010 installed the row-level-security policies and this column split. Re-stating the
+-- column grant here is what keeps a `docker compose up` (which re-runs this file through `roleinit`)
+-- from widening it back; re-asserting rather than trusting that the migration ran first is the point.
+--
+-- Why two controls instead of one: the policies decide WHICH officer rows this role can see (its own
+-- organization), the column grant decides WHICH FIELDS of any visible row it can read. A future change
+-- that loosens one still cannot reach password_hash through the other.
+DO $do$
+DECLARE
+  cols     text;
+  secret   text[] := ARRAY['password_hash', 'salt'];
+  has_0010 boolean;
+BEGIN
+  IF to_regclass('public.users') IS NULL THEN
+    RAISE NOTICE '[DHAROHAR ROLES] users not present yet (run npm run db:migrate first) - skipped';
+    RETURN;
+  END IF;
+
+  SELECT string_agg(c.column_name, ', ' ORDER BY c.ordinal_position) INTO cols
+    FROM information_schema.columns c
+   WHERE c.table_schema = 'public' AND c.table_name = 'users'
+     AND c.column_name <> ALL (secret);
+
+  -- The narrow lookups exist only if 0010 has been applied. If it has not, the column split is still
+  -- imposed (it is strictly safer) but a missing function is reported instead of assumed.
+  SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                  WHERE n.nspname = 'public' AND p.proname = 'dharohar_officer_for_login') INTO has_0010;
+
+  EXECUTE 'REVOKE SELECT ON public.users FROM dharohar_app';
+  EXECUTE format('GRANT SELECT (%s) ON public.users TO dharohar_app', cols);
+  EXECUTE 'GRANT INSERT, UPDATE ON public.users TO dharohar_app';
+  -- Not DELETE: accounts are retired by revoking grants and resetting the password, never removed.
+  EXECUTE 'REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON public.users FROM dharohar_app';
+
+  IF has_0010 THEN
+    EXECUTE 'REVOKE ALL ON FUNCTION public.dharohar_officer_for_login(text) FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON FUNCTION public.dharohar_officer_for_login(text) FROM dharohar_app';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.dharohar_officer_for_login(text) TO dharohar_app';
+    EXECUTE 'REVOKE ALL ON FUNCTION public.dharohar_has_any_officer() FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON FUNCTION public.dharohar_has_any_officer() FROM dharohar_app';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.dharohar_has_any_officer() TO dharohar_app';
+
+    -- The identity role that owns those functions. Re-asserted here because a restore-then-roleinit
+    -- order can land it with less than it needs, and the login path fails closed if it does.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dharohar_identity') THEN
+      EXECUTE 'ALTER ROLE dharohar_identity WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS NOREPLICATION CONNECTION LIMIT 0';
+      EXECUTE 'GRANT USAGE ON SCHEMA public TO dharohar_identity';
+      EXECUTE 'GRANT SELECT ON public.users TO dharohar_identity';
+      RAISE NOTICE '[DHAROHAR ROLES] identity lookups and dharohar_identity attributes re-asserted';
+    ELSE
+      RAISE WARNING '[DHAROHAR ROLES] dharohar_identity is missing although the login lookup exists - run npm run db:migrate';
+    END IF;
+  ELSE
+    RAISE WARNING '[DHAROHAR ROLES] migration 0010 has not been applied: no dharohar_officer_for_login function. Sign-in still needs it - run npm run db:migrate.';
+  END IF;
+
+  -- Refuse to finish claiming least privilege while the credential columns are still readable.
+  IF has_column_privilege('dharohar_app', 'public.users', 'password_hash', 'SELECT')
+     OR has_column_privilege('dharohar_app', 'public.users', 'salt', 'SELECT') THEN
+    RAISE EXCEPTION '[ROLES_LOCKDOWN_FAILED] dharohar_app can read the users credential columns after this script ran';
+  END IF;
+  IF NOT has_column_privilege('dharohar_app', 'public.users', 'organization_id', 'SELECT') THEN
+    RAISE EXCEPTION '[ROLES_LOCKDOWN_FAILED] dharohar_app lost a users column the authorization layer needs';
+  END IF;
+  RAISE NOTICE '[DHAROHAR ROLES] users: SELECT granted on % non-credential columns; password_hash and salt withheld',
+    (SELECT count(*) FROM information_schema.columns c
+      WHERE c.table_schema = 'public' AND c.table_name = 'users' AND c.column_name <> ALL (secret));
+END
+$do$;
+
 -- ---- 4. Append-only audit log: INSERT + SELECT, never UPDATE/DELETE ---------
 -- The append_only_audit_guard trigger rejects UPDATE/DELETE at execution time;
 -- these grants make the same rule true at authorisation time, so a role that

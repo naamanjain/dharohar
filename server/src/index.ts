@@ -106,9 +106,13 @@ async function startServer() {
   if (IS_PRODUCTION && getDbHealth().storageMode === 'postgres-postgis') {
     // Demo personas are disabled in production, so an unseeded database has nobody who can sign
     // in. Say so at boot instead of letting the operator discover it via a login wall.
+    //
+    // A boolean from the database, not a count: `users` is row-level-security scoped to one's own
+    // organization from migration 0010, so at this point in startup — no caller, no tenant — a
+    // `count(*)` would read zero and this warning would fire on every boot of a populated system.
     try {
-      const users = await pool.query('SELECT count(*)::int AS n FROM users');
-      if (users.rows[0].n === 0) {
+      const anyone = await pool.query('SELECT dharohar_has_any_officer() AS present');
+      if (anyone.rows[0]?.present === false) {
         console.warn('[DHAROHAR] WARNING: production database has 0 officer accounts.');
         console.warn('[DHAROHAR] No one can sign in until you provision them: npm run db:seed');
       }

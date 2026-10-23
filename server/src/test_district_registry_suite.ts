@@ -120,8 +120,26 @@ async function main() {
     created.push(A.name);
     console.log(`  note  scratch A ${A.name}\n`);
 
+    // The install is two passes with an attributable human decision between them, by design: 0006
+    // refuses to assign ownership on a register that has no canonical geography, and inventing
+    // districts to make a deploy script finish is the invention this schema refuses everywhere else.
+    // This suite used to run one `db:migrate` and expect the whole ledger, which stopped being true
+    // when 0006 landed — measured 2026-10-23 as rows=5 against 10 files, with every later assertion in
+    // this phase then failing on data that had never been created. Asserting the refusal is the fact;
+    // asserting that the documented second pass completes is the rest of it. See docs/DEPLOYMENT.md §7.
+    const aFirst = runServerScript('db/migrate.ts', A.url);
+    assert('A: pass one stops at 0006 and names the missing basis',
+      aFirst.status !== 0 && /TENANCY_NO_CANONICAL_GEOGRAPHY/.test(aFirst.output),
+      `status ${aFirst.status}: ${aFirst.output.slice(-300)}`);
+    const aDecl = runServerScript('db/declareGeography.ts', A.url, {
+      GEOGRAPHY_DISTRICTS: 'Jaipur,Ajmer,Jodhpur,Udaipur',
+      GEOGRAPHY_ORGANIZATION: 'ORG-DHAROHAR-DEMO',
+      GEOGRAPHY_BY: 'Registry Suite Operator',
+      GEOGRAPHY_REASON: 'canonical districts so the ownership migration has a stated basis',
+    });
+    assert('A: a person-stated declaration of the geography succeeds', aDecl.status === 0, aDecl.output.slice(-400));
     const a1 = runServerScript('db/migrate.ts', A.url);
-    assert('A: db:migrate applies every migration on disk', a1.status === 0, a1.output);
+    assert('A: pass two applies every migration on disk', a1.status === 0, a1.output);
 
     const ac = new Client({ connectionString: A.url });
     await ac.connect();

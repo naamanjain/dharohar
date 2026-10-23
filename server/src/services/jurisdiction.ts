@@ -559,53 +559,97 @@ export async function loadPrincipal(token: AuthTokenPayload): Promise<RequestPri
   const health = getDbHealth();
 
   if (health.storageMode === 'postgres-postgis') {
-    const account = await pool.query(
-      'SELECT id, email, role, display_name, designation, badge_number, district, organization_id FROM users WHERE id = $1 OR email = $2 LIMIT 1',
-      [token.userId, token.email]
-    );
-    if (account.rows.length === 0) return null;
-    const row = account.rows[0];
+    // Since migration 0010 the four authorization tables are scoped by row-level security to "my own
+    // row, or rows inside my organization", so resolving a token is a two-step bind and the ORDER is
+    // the design: bind the officer id from the verified signature, read that one row, and only then is
+    // an organization known well enough to bind. `app.user_id` is never caller-supplied — a token
+    // claiming somebody else's id failed verification before this function was reached, and the GUC is
+    // transaction-local so it cannot outlive this read-only lookup.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.user_id', $1, true), set_config('app.organization_id', '', true)`,
+        [String(token.userId ?? '')]);
 
-    // revoked_at IS NULL is what makes a revocation effective immediately rather than at token
-    // expiry; assignments and capabilities are read fresh on every authenticated request.
-    const jurisdictions = await pool.query(
-      'SELECT district FROM user_jurisdictions WHERE user_id = $1 AND revoked_at IS NULL',
-      [row.id]
-    );
-    const capabilities = await pool.query(
-      'SELECT capability FROM user_capabilities WHERE user_id = $1 AND revoked_at IS NULL',
-      [row.id]
-    );
+      let account = await client.query(
+        `SELECT id, email, role, display_name, designation, badge_number, district, organization_id
+           FROM users WHERE id = $1`,
+        [String(token.userId ?? '')]
+      );
 
-    // The tenant's own district grants, resolved through the account's organization. Revoked rows are
-    // excluded, so withdrawing an organization's authority over a district is an immediate change
-    // rather than a token-lifetime one.
-    const organizationGrants = row.organization_id
-      ? await pool.query(
-          `SELECT d.code AS district, od.relationship
-             FROM organization_districts od
-             JOIN districts d ON d.id = od.district_id
-            WHERE od.organization_id = $1 AND od.revoked_at IS NULL`,
-          [row.organization_id]
-        )
-      : { rows: [] as Array<{ district: string; relationship: 'administers' | 'audits' | 'reads' }> };
+      // A token whose subject is not an officer id — which is what any token minted before the id was
+      // stable looks like — still has to resolve, and the only sanctioned way to find an account before
+      // you know its tenant is the one lookup migration 0010 exists to provide. Exact identifier, at
+      // most one row, no listing.
+      if (account.rows.length === 0 && token.email) {
+        const resolved = await client.query(`SELECT id FROM dharohar_officer_for_login($1)`, [String(token.email)]);
+        if (resolved.rows.length > 0) {
+          await client.query(`SELECT set_config('app.user_id', $1, true)`, [String(resolved.rows[0].id)]);
+          account = await client.query(
+            `SELECT id, email, role, display_name, designation, badge_number, district, organization_id
+               FROM users WHERE id = $1`,
+            [String(resolved.rows[0].id)]
+          );
+        }
+      }
 
-    return {
-      userId: row.id,
-      email: row.email,
-      role: row.role as UserRole,
-      displayName: row.display_name,
-      designation: row.designation,
-      badgeNumber: row.badge_number,
-      organizationId: row.organization_id ?? null,
-      districts: jurisdictions.rows.map((r: any) => r.district).filter(Boolean),
-      capabilities: capabilities.rows.map((r: any) => r.capability as Capability),
-      organizationGrants: organizationGrants.rows.map((r: any) => ({
-        district: String(r.district),
-        relationship: r.relationship as 'administers' | 'audits' | 'reads',
-      })),
-      primaryDistrict: row.district || token.district || '',
-    };
+      if (account.rows.length === 0) return null;
+      const row = account.rows[0];
+
+      // Now the tenant is known, so bind it too: the same transaction then reads only this
+      // organization's grants and capabilities. A tenant-less officer binds '' and the organization
+      // arms match nothing, which is the correct result for that account, not an error.
+      await client.query(`SELECT set_config('app.organization_id', $1, true)`,
+        [String(row.organization_id ?? '')]);
+
+      // revoked_at IS NULL is what makes a revocation effective immediately rather than at token
+      // expiry; assignments and capabilities are read fresh on every authenticated request.
+      const jurisdictions = await client.query(
+        'SELECT district FROM user_jurisdictions WHERE user_id = $1 AND revoked_at IS NULL',
+        [row.id]
+      );
+      const capabilities = await client.query(
+        'SELECT capability FROM user_capabilities WHERE user_id = $1 AND revoked_at IS NULL',
+        [row.id]
+      );
+
+      // The tenant's own district grants. Revoked rows are excluded, so withdrawing an organization's
+      // authority over a district is an immediate change rather than a token-lifetime one.
+      const organizationGrants = row.organization_id
+        ? await client.query(
+            `SELECT d.code AS district, od.relationship
+               FROM organization_districts od
+               JOIN districts d ON d.id = od.district_id
+              WHERE od.organization_id = $1 AND od.revoked_at IS NULL`,
+            [row.organization_id]
+          )
+        : { rows: [] as Array<{ district: string; relationship: 'administers' | 'audits' | 'reads' }> };
+
+      // Read-only resolution: nothing here writes, and ROLLBACK returns the connection to the pool
+      // with both GUCs gone — a COMMIT would do the same for the GUCs, but a rollback states that this
+      // transaction changed nothing.
+      await client.query('ROLLBACK');
+
+      return {
+        userId: row.id,
+        email: row.email,
+        role: row.role as UserRole,
+        displayName: row.display_name,
+        designation: row.designation,
+        badgeNumber: row.badge_number,
+        organizationId: row.organization_id ?? null,
+        districts: jurisdictions.rows.map((r: any) => r.district).filter(Boolean),
+        capabilities: capabilities.rows.map((r: any) => r.capability as Capability),
+        organizationGrants: organizationGrants.rows.map((r: any) => ({
+          district: String(r.district),
+          relationship: r.relationship as 'administers' | 'audits' | 'reads',
+        })),
+        primaryDistrict: row.district || token.district || '',
+      };
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
   }
 
   // Development/demo mode only. Mirrors the database shape so the authorization code has one path:

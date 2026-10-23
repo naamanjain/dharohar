@@ -212,35 +212,68 @@ defect — but it is a real dependency for a government network.
      aggregates, and in `assertParcelReadable` / `assertParcelWritable` / `assertDocumentReadable` /
      `assertDocumentWritable` for every detail and nested path, so a route cannot omit it by forgetting
      to add it.
-   * **Layer two, PostgreSQL row-level security.** Five tables are covered. `parcels` and
+   * **Layer two, PostgreSQL row-level security.** Nine tables are covered. `parcels` and
      `land_documents` carry four policies each (migration 0006), SELECT/INSERT/UPDATE/DELETE separately,
      requiring the session's organization to match the row **and** to match what `users` says about the
      session's user id. `parcel_owners`, `parcel_mutations` and `field_inspections` carry four policies
      each (migration 0009) whose predicate is *the parent parcel must be visible* — the children hold no
      tenant column of their own, so they inherit tenancy from the record they belong to rather than
-     restating it. The GUCs are set with `set_config(..., true)` inside a transaction
-     (`server/src/db/tenant.ts`), never at session scope, so a pooled connection cannot hand its
-     predecessor's tenant to a later request. Unbound reads return zero rows: verified as the runtime
-     role directly, not inferred.
+     restating it. `users`, `user_jurisdictions`, `user_capabilities` and `organization_districts` carry
+     four policies each (migration 0010) keyed on *own row or own organization* rather than on a context
+     discovered from those very tables, which is what kept them out of layer two until now. The GUCs are
+     set with `set_config(..., true)` inside a transaction (`server/src/db/tenant.ts`), never at session
+     scope, so a pooled connection cannot hand its predecessor's tenant to a later request. Unbound reads
+     return zero rows: verified as the runtime role directly, not inferred — and on 2026-10-23 that
+     included `select count(*) from users`, which returned **59** before 0010 and **0** after it.
+   * **The officer tables were the last unrestricted cross-tenant read, and 0010 closed it three ways.**
+     (1) Row-level security on the four authorization tables, as above. (2) The runtime role no longer
+     holds table-level SELECT on `users` at all: `REVOKE SELECT ON public.users` then
+     `GRANT SELECT (every column except password_hash, salt)`, so a hash is unreadable even for a row the
+     role may see — and `scripts/roles.sql` re-asserts that split on every `docker compose up`, raising
+     `[ROLES_LOCKDOWN_FAILED]` if it does not hold. (3) Login no longer queries `users` directly; it calls
+     `dharohar_officer_for_login(text)`, a `SECURITY DEFINER` function owned by a **NOLOGIN** role
+     (`dharohar_identity`) that the runtime role is not a member of, matching one exact identifier
+     (`email`, `id` or `badge_number`) with `LIMIT 1`. Boot-time "does any officer exist" moved to
+     `dharohar_has_any_officer()` for the same reason.
    * **What a refusal looks like.** Another tenant's record and a record that does not exist produce the
      same bytes; an officer whose account has no organization gets `403 TENANT_CONTEXT_MISSING` because
-     that is a configuration someone must be able to see.
-   * **What is deliberately outside the second layer.** `users`, `user_jurisdictions`,
-     `user_capabilities` and `organization_districts` have no policies because `loadPrincipal` reads them
-     to *discover* the tenant before any context exists; a policy keyed on that context would be a closed
-     loop that fails every login. `districts` is shared geography — two tenants may legitimately hold
-     grants on the same district. `append_only_audit_logs` has no policy because chain verification is
-     inherently whole-table, and a filtered chain read reports health about the rows it did not receive
-     (`scripts/test-rls-blind-certifier.sh` proves the certifier refuses instead). `organization_units`
-     has no policy because nothing in the application reads or writes it yet — measured, not assumed.
-     The full table-by-table reasoning, with the queries that reproduce it, is `docs/TENANT-DATA-ACCESS.md`.
-   Measured on a disposable copy with `./scripts/test-authorization-on-copy.sh`:
-   `test:jurisdiction` 46/0, `test:provisioning` 91/0, `test_tenancy_isolation_suite.ts` 68/0 — including
+     that is a configuration someone must be able to see. The same indirection now applies to officers:
+     revoking a jurisdiction across the tenant boundary returns `404 OFFICER_NOT_FOUND` rather than
+     confirming that the account exists.
+   * **What is still deliberately outside the second layer.** `districts` is shared geography — two
+     tenants may legitimately hold grants on the same district. `append_only_audit_logs` has no policy
+     because chain verification is inherently whole-table, and a filtered chain read reports health about
+     the rows it did not receive (`scripts/test-rls-blind-certifier.sh` proves the certifier refuses
+     instead). `organization_units` has no policy because nothing in the application reads or writes it
+     yet — measured, not assumed. The full table-by-table reasoning, with the queries that reproduce it,
+     is `docs/TENANT-DATA-ACCESS.md`.
+   * **Two things this layer does not do, asserted rather than promised.** First, the policies are keyed
+     on GUCs that the connection itself can write, so the runtime role *can* assert a tenant without a
+     token: measured on 2026-10-23, `select count(*) from users` returns 0 unbound, and after
+     `set_config('app.organization_id', <that tenant>, false)` returns exactly that tenant's officers —
+     zero rows of any other tenant, and still zero parcels, because the record policies also require a
+     session user that resolves in `users`. Row-level security is a defence against a query that forgot
+     its predicate, not against the identity that runs the application. Second, the sanctioned login
+     lookup is `SECURITY DEFINER`, so for **one exact identifier that is already known** it returns that
+     officer's row including `password_hash` and `salt` — 128 hex characters of PBKDF2 verifier, measured.
+     Enumeration is gone; a targeted lookup by a guessed identifier is the remaining cross-tenant read.
+     `test_tenancy_isolation_suite.ts` §9 pins both facts as assertions so that a change is visible. The
+     way to close the second one is architectural, not another policy: an authentication path with its own
+     database identity, holding the only grant that can read a credential column, so the runtime role that
+     serves every other query has none. That is not built, and tenant isolation must not be described as
+     complete while it is not.
+   Measured on a disposable copy with `./scripts/test-authorization-on-copy.sh` on 2026-10-23:
+   `test:jurisdiction` 46/0, `test:provisioning` 91/0, `test_tenancy_isolation_suite.ts` **101/0** — including
    two tenants granted the same district each reading only their own parcel, listings, search, nested
    document and inspection routes, the officer roster, registry counts, cross-tenant document download,
    grant revocation, `audits` opening reads but never writes, the child tables read directly as
    `dharohar_app` with no context, with a forged context, and written cross-tenant, a role changed in
-   the database while its token stayed valid, and a pooled connection checked for tenant carry-over.
+   the database while its token stayed valid, and a pooled connection checked for tenant carry-over —
+   and, new with 0010, §9 "PRINCIPAL DATA": what each tenant can and cannot see in `users`, its postings,
+   its capabilities and its district grants, the credential columns by privilege *and* by attempt, the
+   identity role's attributes and non-membership, the roster of a second-tenant administrator, the
+   tenant-less administrator's roster of exactly one account, the self-asserted-context limit, and the
+   login-lookup residual.
 7b. **Document bytes are stored, retrieved and now round-trip verified.** Re-measured on 2026-10-21: a
    2,000,000-byte payload written through `POST /api/documents` was read back and hashed to the same
    digest at rest, and the same payload survived `pg_dump` → second-location copy → restore → compare

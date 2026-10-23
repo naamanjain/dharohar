@@ -19,6 +19,9 @@ backups-*/
 
 # Scratch working files and one-off probes.
 tmp/
+# encrypted-backup-drill.sh decrypts into here to prove the round trip. If the run crashes the
+# decrypted archive stays on disk, so this directory must never be committable.
+.enc-drill-tmp/
 *.bak
 *.orig
 

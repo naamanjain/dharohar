@@ -20,6 +20,7 @@
 
 import crypto from 'crypto';
 import { initDbConnection, getDbHealth, pool } from './db/db';
+import { tenantQuery } from './db/tenant';
 import { loadPrincipal, RequestPrincipal } from './services/jurisdiction';
 import {
   setOfficerCapabilities,
@@ -35,15 +36,36 @@ const REASON = String(
 ).trim();
 
 async function findActor(): Promise<RequestPrincipal | null> {
+  const wanted = String(process.env.RESIDUE_ADMIN_EMAIL || '').trim();
+
+  // Migration 0010 put `users` under row-level security, so this enumeration returns ZERO rows to the
+  // runtime role — which is the whole point of the migration, and it quietly broke this script: it
+  // exited 4 ("no usable USER_ADMIN officer") while the administrator sat in the table the whole time.
+  // The refusal was correct behaviour from a blind identity, which is the failure mode this project has
+  // now hit three times. A named administrator is resolved through the one lookup that exists for reads
+  // before a tenant is known — the same exact-identifier function login uses.
+  if (wanted) {
+    const resolved = await loadPrincipal({ userId: '', email: wanted } as any);
+    if (resolved && resolved.capabilities.includes('USER_ADMIN')) return resolved;
+    console.error(`[RETIRE] RESIDUE_ADMIN_EMAIL='${wanted}' did not resolve to an officer holding an active USER_ADMIN capability.`);
+    return null;
+  }
+
   const holders = await pool.query(
     `SELECT u.id, u.email FROM users u
        JOIN user_capabilities c ON c.user_id = u.id
       WHERE c.capability = 'USER_ADMIN' AND c.revoked_at IS NULL
       ORDER BY u.email`
   );
-  if (holders.rowCount === 0) return null;
+  if (holders.rowCount === 0) {
+    console.error('[RETIRE] no USER_ADMIN holder is visible to this identity. Since migration 0010 the runtime role');
+    console.error('[RETIRE] cannot enumerate officers at all, so this is either "there is none" or "I am not allowed');
+    console.error('[RETIRE] to see them" and the script cannot tell. Set RESIDUE_ADMIN_EMAIL=<the address>, or run');
+    console.error('[RETIRE] it as the schema owner: docker compose -f docker-compose.prod.yml --profile tools \\');
+    console.error('[RETIRE]   run --rm -e RESIDUE_APPLY=true maint dist-server/retireSuiteResidue.js');
+    return null;
+  }
 
-  const wanted = String(process.env.RESIDUE_ADMIN_EMAIL || '').trim();
   const chosen = wanted
     ? holders.rows.find((r: any) => r.email === wanted)
     : holders.rowCount === 1
@@ -73,14 +95,20 @@ async function main() {
 
   const actor = await findActor();
   if (!actor) {
-    console.error('[RETIRE] no usable USER_ADMIN officer found, so there is no identity to attribute the');
-    console.error('[RETIRE] revocations to. Bootstrap one (npm run db:bootstrap-admin) and re-run.');
+    console.error('[RETIRE] no usable USER_ADMIN officer was found or resolved. Either none exists');
+    console.error('[RETIRE] (bootstrap one with npm run db:bootstrap-admin) or this identity is not');
+    console.error('[RETIRE] allowed to see it — the message above says which.');
     process.exit(4);
   }
   console.log(`[RETIRE] acting as ${actor.email} (${actor.userId}), capabilities: ${actor.capabilities.join(', ')}`);
   console.log(`[RETIRE] retiring accounts whose email ends with ${SUFFIX}${APPLY ? '' : ' — DRY RUN, nothing will change'}`);
 
-  const candidates = await pool.query(
+  // Read through the actor's own tenant context. `users`, `user_jurisdictions` and `user_capabilities`
+  // are row-level-security scoped since migration 0010, so an unbound pool query here returns zero rows
+  // and the script would report "nothing to retire" about 54 accounts that are sitting in this very
+  // tenant. In a multi-tenant deployment each tenant's residue is retired by an administrator of that
+  // tenant, or by the schema owner through `maint` — never by one tenant reading another's officers.
+  const candidates = await tenantQuery(actor,
     `SELECT u.id, u.email, u.role,
             coalesce(j.districts, '') AS districts,
             coalesce(c.capabilities, '') AS capabilities
@@ -105,15 +133,22 @@ async function main() {
 
   if (candidates.rowCount === 0) {
     const pattern = `%${SUFFIX}`;
-    const anyMatch = await pool.query(`SELECT count(*)::int AS n FROM users WHERE email LIKE $1`, [pattern]);
-    if (anyMatch.rows[0].n === 0) {
-      console.error(`[RETIRE] no row in users matches '${pattern}', so the table was scanned and nothing was`);
-      console.error('[RETIRE] found. A "nothing to retire" that came from a pattern matching nothing is not a');
-      console.error('[RETIRE] clean result. Suite-created officers end in @dharohar.test; check the suffix.');
+    const anyMatch = await tenantQuery(actor, `SELECT count(*)::int AS n FROM users WHERE email LIKE $1`, [pattern]);
+    const n = anyMatch.rows[0]?.n ?? 0;
+    if (n === 0) {
+      // Two states produce this, and row-level security makes them indistinguishable from inside it:
+      // no such account exists, or it exists in a tenant this actor may not read. Say which of the two
+      // is being claimed — here, neither — and name the identity that can settle it. A "nothing to
+      // retire" that came from a scan of a table the caller cannot see is not a clean result.
+      console.error(`[RETIRE] no account matching '${pattern}' is visible to ${actor.email}`);
+      console.error(`[RETIRE] (organization ${actor.organizationId ?? 'NONE'}). Whether that means there is nothing`);
+      console.error(`[RETIRE] to retire, or the residue belongs to a tenant this identity is not allowed to read,`);
+      console.error(`[RETIRE] cannot be told from inside row-level security. Settle it as the schema owner:`);
+      console.error(`[RETIRE]   docker compose -f docker-compose.prod.yml --profile tools run --rm -e RESIDUE_APPLY=true maint dist-server/retireSuiteResidue.js`);
       await pool.end();
       process.exit(5);
     }
-    console.log(`[RETIRE] ${anyMatch.rows[0].n} account(s) match '${pattern}' and every one holds USER_ADMIN, so none is retired.`);
+    console.log(`[RETIRE] ${n} account(s) match '${pattern}' and every one holds USER_ADMIN, so none is retired.`);
     await pool.end();
     return;
   }

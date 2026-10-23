@@ -142,6 +142,83 @@ second one was measured.
    `for c in $(git rev-list origin/main); do git grep -I '<literal>' "$c"; done` must find nothing.
 7. Disposition the scanner alerts manually — see `docs/SECURITY.md` §8.
 
+### Rotating the runtime database credential (`dharohar_app`)
+
+Distinct from the case above: here the secret was never in a file that Git can rewrite — it was
+*displayed*. A `docker inspect` of the API container printed `DHAROHAR_APP_PASSWORD` into a chat
+transcript on 2026-10-23, and a later attempt to list "variable names only" from the rendered compose
+file printed the whole `DATABASE_URL:` line because YAML renders `key: value`, not `key=value`. Both
+times the value went to a place it should not have gone. The rule that follows from that: when redacting
+a secret, count **occurrences of the value**, never lines, because a line that contains it is now a line
+that shows it.
+
+Where the credential actually lives — measured on 2026-10-23, by digest, before touching anything:
+
+```
+.env  DHAROHAR_APP_PASSWORD  ──compose interpolation──┬─→ roleinit: environment DHAROHAR_APP_PASSWORD
+        digest 4806a5129364                           │     └→ psql -v app_password=… → scripts/roles.sql
+                                                      │         ALTER ROLE dharohar_app … PASSWORD :'app_password'
+                                                      ├─→ roleinit: PGPASSWORD (same value, different name)
+                                                      └─→ api: DATABASE_URL postgresql://dharohar_app:…@db:5432
+                                                            and api: PGPASSWORD
+```
+
+The API container does **not** receive `DHAROHAR_APP_PASSWORD` itself (its digest there was the empty
+string), so `.env` is the single source and there is no second copy of the secret to find. Three other
+holders exist and are deliberately *not* part of this rotation: `POSTGRES_PASSWORD` (the owner identity
+`dharohar`, used by `migrate`, `roleinit` and `maint`), `DHAROHAR_VERIFIER_PASSWORD`
+(read-only `dharohar_verifier`, never exposed) and `DEMO_PASSWORD` (officer logins — a different layer
+entirely; rotating a database role does not log anybody out). `.env` also still carries `PGUSER=postgres`
+and a `PGPASSWORD` for a role that does not exist in the container: stale leftovers, untouched, and the
+digest comparison above is what proves they stayed untouched.
+
+Do it with the script, which is this procedure with rails on:
+
+```bash
+./scripts/rotate-app-credential.sh --check    # maps the holders and changes nothing
+./scripts/rotate-app-credential.sh            # rotate, verify both directions, revert itself on failure
+```
+
+What it does, and how each step is proved rather than asserted (this is the run that executed on
+2026-10-23):
+
+1. **Generate** `openssl rand -hex 32`. Hex, not base64: compose interpolates the value into
+   `DATABASE_URL` raw, and a `/` or `+` makes the URL unparseable — the API then dies with `Invalid URL`,
+   which names neither the setting nor the cause.
+2. **Rewrite exactly one span of bytes in `.env`.** A literal string replacement, not a regex over the
+   file, because `.env` here is mixed CRLF/LF and a rewrite would normalise terminators and make the diff
+   lie. Proof: the file grows by exactly the length difference (574 → 606 bytes for 32 → 64 characters),
+   and a digest over *all the other* secrets is equal before and after
+   (`88b98d72b991` on both sides).
+3. **Re-assert the role** through the supported path: `docker compose -f docker-compose.prod.yml up -d
+   roleinit`. Proof: exit 0, and `md5(rolpassword)` of `dharohar_app` in `pg_authid` changes
+   (`d29e4294…` → `ee2f310a…`). That digest is of the SCRAM verifier, not the password.
+4. **Test both directions** — the step that separates a rotation from a hope:
+
+   ```bash
+   printf '%s\n' "<the old value>" | docker compose -f docker-compose.prod.yml run --rm --no-deps -T db \
+     psql -h db -U dharohar_app -d dharohar -W -tAc 'select current_user'
+   #   → FATAL: password authentication failed for user "dharohar_app"      (this is the PASS)
+   ```
+
+   then the same with the new value → `dharohar_app`. The password travels through **stdin**; note `-W`
+   (force the prompt) — `-w` means *never* prompt, and every attempt then fails with
+   `fe_sendauth: no password supplied` for a reason that has nothing to do with the credential. Neither
+   value is ever a command-line argument (it would sit in the process list and the shell history).
+5. **Recreate the dependent service**: `up -d --force-recreate api`, because an already-open pool holds
+   connections authenticated under the old credential and will keep working — which is exactly how a
+   "successful" rotation can leave a live old password in service. Proof: `/api/health/ready` returns 200
+   (`/api/health` only reports the boot mode; `/ready` probes the database **live**, so it is the
+   endpoint that proves the running service authenticated with the new value).
+6. **On any failed check the script restores the previous value**, re-runs `roleinit`, and compares the
+   verifier digest against the one it captured at the start — so a half-applied rotation cannot be
+   mistaken for a finished one.
+
+If you must do it by hand instead: edit the one line in `.env`, then run steps 3–5's three commands, then
+`git status --porcelain .env` (must print nothing; `.env*` is ignored) and the two `psql -W` attempts
+above. What you may not skip is step 4 in both directions: this project has already had a rotation
+report success while the deployed service still accepted the old credential.
+
 ---
 
 ## 5. DNS records for `urbantechx.in`
@@ -313,11 +390,14 @@ docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
 | `0007` | a declaration is `candidate`, not canonical geography; promotion needs `USER_ADMIN` + a reason | same drill, §5d; `validate-stack.sh` asserts the default and that retired fixtures stay retired |
 | `0008` | audit entries record `actor_user_id` / `actor_organization_id`, outside the entry hash | same drill, §5e — including that the chain digest is unchanged by a re-apply |
 | `0009` | `parcel_owners`, `parcel_mutations` and `field_inspections` come under row-level security by inheriting their **parent parcel's** policy — a co-sharer list, a mutation history and a field survey no longer depend on the query that joins them | same drill, §5f: apply, 12 policies asserted by predicate and role, the guard fired on purpose by dropping 0006's policy, rollback refused while a foreign policy exists, re-apply after rollback |
+| `0010` | the four authorization tables stop being the exception: `users`, `user_jurisdictions`, `user_capabilities` and `organization_districts` come under row-level security (own row **or** own organization), `dharohar_app` loses table-level SELECT on `users` and keeps it on 17 of 19 columns (`password_hash`, `salt` revoked), and login moves to two `SECURITY DEFINER` functions owned by a **NOLOGIN** `dharohar_identity` role | same drill, §5g; `scripts/test-authorization-on-copy.sh` §9 of the tenancy suite; `scripts/test-fresh-install.sh` proves it applies on a from-nothing database, where the privilege half is deferred to `roleinit` |
 
-Each of `0006`, `0007` and `0008` aborts if the migration it is stated against has not been applied, so
-they cannot be applied out of order, and each has a `rollback-NNNN.sql` that refuses rather than
-guessing: 0006's refuses to erase a human ownership assignment, 0007's refuses while candidate districts
-are unresolved.
+Each of `0006`, `0007`, `0008` and `0010` aborts if the migration it is stated against has not been
+applied, so they cannot be applied out of order, and each has a `rollback-NNNN.sql` that refuses rather
+than guessing: 0006's refuses to erase a human ownership assignment, 0007's refuses while candidate
+districts are unresolved, 0010's refuses while any policy it did not create is attached to the four
+tables it protects — because dropping those would silently un-secure them — and warns in its own output
+that rolling it back restores the runtime role's ability to read every password hash.
 
 ### Prove a migration on a copy before the runner ever sees it
 
@@ -393,19 +473,28 @@ checked against the rows it writes rather than its exit codes, and a migration d
 planting a second tenant — then diagnosed, resolved by removing the ambiguity rather than by editing the
 migration, and completed.
 
-### The three database identities
+### The four database identities
 
 | identity | what it can do | who uses it |
 | --- | --- | --- |
 | `dharohar` | schema owner, superuser in the container | `migrate`, `roleinit`, `seed`, `maint` one-shots only — never the API |
-| `dharohar_app` | SELECT/INSERT/UPDATE on operational tables, DELETE on `parcel_owners` only, INSERT+SELECT on the audit ledger, SELECT on the ledger table; no DDL, no TRUNCATE, `NOBYPASSRLS`, `NOINHERIT`, `NOCREATEROLE` | the long-running API |
+| `dharohar_app` | SELECT/INSERT/UPDATE on operational tables, DELETE on `parcel_owners` only, INSERT+SELECT on the audit ledger, SELECT on the ledger table; **on `users`, INSERT and UPDATE plus SELECT on 17 of 19 columns — `password_hash` and `salt` are not readable by it**; no DDL, no TRUNCATE, `NOBYPASSRLS`, `NOINHERIT`, `NOCREATEROLE` | the long-running API |
 | `dharohar_verifier` | **SELECT on everything, `BYPASSRLS`, no superuser, no write privilege of any kind** | `verify` one-shot: district integrity and audit-chain certification |
+| `dharohar_identity` | SELECT on `users` only, `BYPASSRLS`, **`NOLOGIN`, `CONNECTION LIMIT 0`**, and it owns exactly the two functions the login path is allowed to call | nobody connects as it; PostgreSQL executes those functions as it |
 
 The third exists because validating the audit chain requires reading every entry in every tenant. Doing
 that as the schema owner hands a routine diagnostic the one credential that can rewrite history; doing
 it as `dharohar_app` produces a *false* report, because row-level security hides rows and the validator
 then certifies the chain it was allowed to see. `scripts/test-rls-blind-certifier.sh` demonstrates the
 second failure on a disposable copy and shows the certifier refusing with exit 2 instead.
+
+The fourth exists because login has to find a person *before* a tenant context exists, which is the one
+thing a tenant policy cannot do. A `SECURITY DEFINER` function needs an owner that can see past the
+policies, and giving that to the schema owner or to the runtime role would be worse than the problem.
+So the functions belong to a role that cannot log in, cannot be a member of anything, and holds one
+table read. Migration 0010 and `scripts/roles.sql` both refuse if it ever becomes login-capable, and the
+tenancy suite measures `pg_has_role('dharohar_app','dharohar_identity','MEMBER')` is false — otherwise
+`BYPASSRLS` would be one `GRANT` away from the API's own identity.
 
 ```bash
 docker compose -f docker-compose.prod.yml --profile tools run --rm \
@@ -523,36 +612,120 @@ PGUSER=dharohar ./scripts/backup.sh \
 # Exit codes: 0 ok, 2 usage, 3 refused by the safety gate, 4 restore failed
 ```
 
-### The dump is not a backup until it leaves the machine
+### The dump is not a backup until it leaves the machine — encrypted
 
-Both the data volume and `./backups` live on the same host disk, so a lost VM destroys the records and
-their restore point together. Measured on 2026-10-19: dumps sat in `backups/` beside
-`/var/lib/docker/volumes/dharohar-prod_dharohar_pgdata` — one failure domain, which is what "no backup"
-means in practice. Copy each dump off-machine on the same schedule that makes it:
+Two independent properties are required and neither implies the other:
+
+* **durability** — a copy that survives this laptop dying;
+* **confidentiality** — a copy that is worthless to whoever intercepts it.
+
+A `pg_dump -Fc` archive is **not** encrypted, and measured on 2026-10-23 it is not even opaque:
+`pg_restore --list` reads its manifest with no key and prints `TABLE DATA public parcels`, the object
+names are greppable in the bytes (`parcels` appears 118 times, `officer` 10 times), and the per-row
+data inside each blob is zlib-compressed but not encrypted. Anyone holding the file holds every
+officer, every parcel, every base64 document and the whole audit chain.
+
+What is on this machine today, measured rather than assumed:
+
+| Thing | Measured 2026-10-23 |
+| --- | --- |
+| Second-location tooling | `rclone` **not installed**, `restic` **not installed**, `aws`/`ossutil` **not installed**, no `%APPDATA%\rclone\rclone.conf`, no mapped network drive (`net use` → "no entries"). `gpg` and `openssl` are present. |
+| Where the dumps live | `backups/` **inside the repository**, which is at `C:\Users\allin\OneDrive\Desktop\AI\DHAROHAR` |
+| Sync exposure | the Desktop known folder is redirected to `C:\Users\allin\OneDrive\Desktop` (registry `HKCU\…\User Shell Folders`) and the OneDrive sync-root marker folder exists, so this tree **is** a sync root by location. At the time of checking the OneDrive client was not running and no account was configured under `HKCU\Software\Microsoft\OneDrive\Accounts`, and the dumps carry only the `A` attribute (no cloud placeholder). **So no upload is proven — and none is excluded.** If the client ever signs in on this machine, 69 plaintext archives upload with it. |
+| Accumulation | 69 `.dump` files, ~16 MB, no retention rule applied yet |
+
+`scripts/backup.sh` now refuses to stay quiet about this: when the resolved output directory lies under
+a cloud-sync path it prints a `WARNING:` naming the directory and pointing at the encrypted drill. It
+warns and still writes — the warning is the operator's signal, not a lock-out. Verified both directions
+on 2026-10-23: the warning fires for `backups/` in this tree and stays silent for `C:\temp-dh-backup`.
+
+#### The encrypted leg, executed
 
 ```bash
-# Once a day, keep 30 days, and verify the copy before pruning the local file.
-cron: 30 2 * * * root /usr/local/bin/dharohar-backup && /usr/local/bin/dharohar-copy-offsite
-
-# dharohar-copy-offsite — any second location counts; two of these commands are ₹0-class options:
-#   (a) another cheap VM you own, over ssh (rsync needs a key, not a password)
-rsync -a --delete-after /var/backups/dharohar/ backupuser@second-host::dharohar/
-#   (b) an object store with a free tier, via rclone (server-side encryption at the provider)
-rclone copy /var/backups/dharohar "remote:dharohar-backups" --min-age 1m --checksum
-
-# Then prove the off-machine copy is the same file, not a truncated transfer:
-ssh backupuser@second-host 'cd dharohar && sha256sum -c dharohar_dharohar_<stamp>.dump.sha256'
+BACKUP_PASSPHRASE='≥20 characters, exported into the environment — never an argument' \
+  ./scripts/encrypted-backup-drill.sh
 ```
 
-Three rules that make this a backup rather than a copy:
-1. **Encrypt before it leaves.** The dump contains every document byte and officer row. `rclone crypt`,
-   or `age -r <recipient-key> file.dump -o file.dump.age`, before transfer — never a plaintext dump in a
-   cloud bucket you did not encrypt.
-2. **Restore-test the off-machine copy, not the local one.** Quarterly, pull a dump from the second
-   location and restore it into a disposable database and run the checks below. An unreadable archive is
-   the usual way a year of backups turns out to be nothing.
-3. **Never restore over the only copy.** `scripts/restore.sh` refuses a non-empty target and exits 3
-   unless you pass `--allow-non-empty`; do not pass that flag against a database holding real records.
+AES-256-CBC, PBKDF2-HMAC-SHA256 with 200,000 iterations, salted by default. Run 2026-10-23:
+**38 checks passed, exit 0.** It dumps through `backup.sh`, encrypts to
+`backups/encrypted/<stamp>.dump.enc`, and proves each step instead of asserting it:
+
+* the plaintext's `PGDMP` magic and its object names are present in the archive and **absent** from the
+  ciphertext, which is a real file of a real size with a different digest;
+* `pg_restore --list` **succeeds** on the plaintext (no key needed) and **fails** on the ciphertext with
+  *"input file does not appear to be a valid archive"* — the same tool, both sides, so the check can
+  only pass if the encryption did something;
+* the wrong passphrase cannot read it back (`bad decrypt`, exit 1);
+* decrypting with the right passphrase reproduces the archive **byte for byte** (SHA-256 equal);
+* the **decrypted** copy restores into a disposable database `encdrill_*` on `dharohar-audit-pg` and
+  matches the deployed register: parcels 43, land_documents 47, users 59, districts 16,
+  organization_districts 4, parcel_owners 44, schema_migrations 10 (ledger `0001…0010` identical),
+  31 owner-tagged parcels, 43/43 valid geometries, row-level security still enabled on `parcels`;
+* the largest document payload (`bytes-proof-1792520519025`) hashes to the same md5 on both sides
+  (`d4019b0f…`), and the **whole audit chain** — 2,520 entries folded into one md5 — is identical
+  (`a5e9148a…`).
+
+It deletes the decrypted working copy, keeps the encrypted archive, and prints how many plaintext
+archives are still sitting in `backups/` — because deleting the working copy does not touch them.
+
+**What this does NOT prove, and the script says so in its own output:** every byte above is still on
+this machine. Encryption at rest without a copy that leaves is confidentiality with no durability.
+The transfer leg is **NOT EXECUTED** because this workstation has no external destination and no
+credentials for one; `rclone` is not installed. It is an owner step, below.
+
+#### Owner-side transfer (the leg that is not executed here)
+
+Pick one destination. ₹0-class options first; the requirement is only that it is *not this disk*.
+
+```bash
+# (a) second machine or VM you own, over SSH — rsync copies inside an encrypted SSH channel
+rsync -av --checksum backups/encrypted/ backupuser@second-host:/var/backups/dharohar/
+
+# (b) object storage with a free tier (B2 10 GB, R2, Backblaze, a Hetzner bucket). Install rclone once:
+winget install rclone.rclone
+rclone config                     # n → new remote → your provider → leave 'env auth' on
+#   then encrypt the *contents* too, so the provider never sees a readable archive:
+rclone copy backups/encrypted/ "remote:dharohar-backups" --checksum --min-age 1m --fast-list
+
+# (c) no network at all: an encrypted USB drive, kept somewhere other than next to the laptop.
+```
+
+Then prove the leg you just took, by restoring **from the destination**, not from the local file:
+
+```bash
+rclone copy "remote:dharohar-backups" ./verify-download --include "*.dump.enc"
+BACKUP_PASSPHRASE='…' openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+  -in verify-download/<stamp>.dump.enc -out verify-download/<stamp>.dump
+cd verify-download && sha256sum -c ../backups/<stamp>.dump.sha256   # digest across the wire
+./scripts/restore.sh --container dharohar-audit-pg --dbname restore_from_offmachine_$(date +%s) \
+  --create-db --input verify-download/<stamp>.dump
+```
+
+Four rules that turn a copy into a backup:
+
+1. **Encrypt before it leaves**, and keep the ciphertext and the passphrase apart. `openssl enc` (built
+   in here), `rclone crypt`, `age`, or `gpg --symmetric` — any of them; a plaintext dump in a bucket you
+   did not encrypt is a disclosure waiting to happen. Moving the repo (or `backups/`) outside a
+   cloud-synced folder is part of this rule, not a separate one.
+2. **Access restrictions.** One credential per destination, held by you, not shared with the app and not
+   stored in `.env`. For object storage use a key that can *write only* to that bucket prefix and cannot
+   list or delete the account's other buckets. For an SSH target use a dedicated key with
+   `command="rsync --server -s …"` forced in `authorized_keys` so the key only receives backups.
+3. **Retention, applied and checked.** 30 days rolling is the documented default:
+   `rclone delete "remote:dharohar-backups" --min-age 30d --rmdirs` (or `find … -mtime +30 -delete`),
+   run *after* a successful checksum verification of the new copy, never before. Keep at least one copy
+   that an administrator with a grudge — or a ransomware process running as your user — cannot rewrite:
+   an object store with versioning or object-lock, or a USB drive that is normally unplugged.
+4. **Restore-test the off-machine copy quarterly**, into a disposable database, with the digest checks
+   above. An unreadable archive is how a year of backups turns out to be nothing.
+
+**Credential handling for the passphrase.** Store it in the same place you store your other master
+secrets (a password manager), not in a file, not in `.env`, not in a shell script, and not in the
+repository — `.gitignore` cannot protect you from a passphrase that was committed on purpose.
+Rotate it whenever a copy leaves a destination you no longer control; re-encryption is cheap
+(295 KB took under a second) and the only cost is that old archives then need the old passphrase.
+Losing it is unrecoverable by design, which is the same fact as "it is actually encrypted".
+
 
 ### What a restore drill has to prove (and what was proven on 2026-10-19)
 
@@ -641,7 +814,8 @@ string (compose interpolation failure, daemon unreachable, container missing) is
 than compared against another error string. That is not theoretical — a run with the daemon dead
 produced exactly such a false PASS before the guard existed.
 
-`npm run test:jurisdiction` (46 assertions) and `npm run test:provisioning` (57 assertions) are the
+`npm run test:jurisdiction` (46 assertions) and `npm run test:provisioning` (91 assertions, measured on
+the copy drill 2026-10-23) are the
 negative tests: an officer of District A denied District B through ID substitution, query parameters,
 alternate endpoints, document references and audit reads, with the foreign row snapshotted before and
 after; plus multi-district grants, immediate revocation, state-wide read without mutation, the logging

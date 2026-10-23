@@ -133,6 +133,32 @@ fi
 mkdir -p "$OUT_DIR"
 [[ -e "$OUT_FILE" && $FORCE -eq 0 ]] && die "refusing to overwrite existing file $OUT_FILE (pass --force)" 2
 
+# A pg_dump custom archive is plaintext to anyone who holds it, and the default output directory is
+# inside the repository — which on this workstation is inside a personal cloud-sync folder. Warn
+# rather than fail: the warning is the operator's only signal that "backup" and "uploaded copy" may
+# be the same event. Detection is the Windows spelling of the path plus the sync-root marker folder.
+SYNC_NOTE=""
+OUT_WIN="$(cd "$OUT_DIR" && (pwd -W 2>/dev/null || pwd) || echo "$OUT_DIR")"
+case "$(printf '%s' "$OUT_WIN" | tr '[:upper:]' '[:lower:]')" in
+  *onedrive*|*dropbox*|*googledrive*|*"google drive"*|*icloud*|*megasync*|*sync*) SYNC_NOTE="a folder whose name says cloud-sync" ;;
+esac
+if [[ -z "$SYNC_NOTE" ]]; then
+  p="$OUT_DIR"
+  while [[ -n "$p" && "$p" != "/" ]]; do
+    if compgen -G "$p/.849C9593-D756-4E56-8D6E-42412F2A707B/*" >/dev/null 2>&1 \
+       || [[ -e "$p/Dropbox" || -e "$p/.dropbox" || -e "$p/Google Drive" ]]; then
+      SYNC_NOTE="under a live sync-root marker"; break
+    fi
+    p="$(dirname "$p")"
+  done
+fi
+if [[ -n "$SYNC_NOTE" ]]; then
+  info "WARNING: $OUT_DIR is $SYNC_NOTE ($OUT_WIN)."
+  info "         The archive written here is UNENCRYPTED land records. If a sync client ever signs in on"
+  info "         this machine, this directory uploads. Take backups to a path outside it (--output D:/...)"
+  info "         or encrypt them: ./scripts/encrypted-backup-drill.sh (docs/DEPLOYMENT.md §8)."
+fi
+
 DUMP_ARGS=(--no-owner --no-privileges --encoding=UTF8)
 if [[ "$FORMAT" == "custom" ]]; then DUMP_ARGS+=(--format=custom --compress=6); else DUMP_ARGS+=(--format=plain); fi
 

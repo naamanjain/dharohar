@@ -12,6 +12,7 @@
 
 import { PoolClient } from 'pg';
 import { pool, getDbHealth } from '../db/db';
+import { beginTenantTransaction, tenantQuery } from '../db/tenant';
 import { recordAuditLog } from './auditService';
 import { hashPassword } from '../utils/crypto';
 import { UserRole } from '../types/backend';
@@ -184,9 +185,11 @@ export async function createOfficer(input: NewOfficer, actor: RequestPrincipal):
   const { hash, salt } = hashPassword(input.password);
   const createdAt = new Date().toISOString();
 
-  const client = await pool.connect();
+  // Runs inside the actor's tenant transaction: since migration 0010 the officer and grant tables
+  // carry WITH CHECK clauses, so a write made on an unbound connection is refused by the database
+  // rather than silently landing in whichever tenant the row's columns happen to name.
+  const client = await beginTenantTransaction(actor);
   try {
-    await client.query('BEGIN');
 
     const clash = await client.query('SELECT id, email FROM users WHERE id = $1 OR LOWER(email) = $2', [id, email]);
     if (clash.rows.length > 0) {
@@ -266,9 +269,11 @@ export async function setOfficerJurisdictions(
   const why = String(reason ?? '').trim();
   if (!why) throw new ProvisioningRejected('REASON_REQUIRED', 'A jurisdiction change must state its reason.');
 
-  const client = await pool.connect();
+  // Runs inside the actor's tenant transaction: since migration 0010 the officer and grant tables
+  // carry WITH CHECK clauses, so a write made on an unbound connection is refused by the database
+  // rather than silently landing in whichever tenant the row's columns happen to name.
+  const client = await beginTenantTransaction(actor);
   try {
-    await client.query('BEGIN');
     await loadOfficer(client, userId);
 
     const before = await activeDistricts(client, userId);
@@ -319,9 +324,11 @@ export async function setOfficerCapabilities(
   const why = String(reason ?? '').trim();
   if (!why) throw new ProvisioningRejected('REASON_REQUIRED', 'A capability change must state its reason.');
 
-  const client = await pool.connect();
+  // Runs inside the actor's tenant transaction: since migration 0010 the officer and grant tables
+  // carry WITH CHECK clauses, so a write made on an unbound connection is refused by the database
+  // rather than silently landing in whichever tenant the row's columns happen to name.
+  const client = await beginTenantTransaction(actor);
   try {
-    await client.query('BEGIN');
     await loadOfficer(client, userId);
 
     const before = await activeCapabilities(client, userId);
@@ -373,9 +380,11 @@ export async function setOfficerRole(
   const why = String(reason ?? '').trim();
   if (!why) throw new ProvisioningRejected('REASON_REQUIRED', 'A role change must state its reason.');
 
-  const client = await pool.connect();
+  // Runs inside the actor's tenant transaction: since migration 0010 the officer and grant tables
+  // carry WITH CHECK clauses, so a write made on an unbound connection is refused by the database
+  // rather than silently landing in whichever tenant the row's columns happen to name.
+  const client = await beginTenantTransaction(actor);
   try {
-    await client.query('BEGIN');
     const row = await loadOfficer(client, userId);
     const before = row.role;
 
@@ -424,9 +433,11 @@ export async function resetOfficerPassword(
   if (!why) throw new ProvisioningRejected('REASON_REQUIRED', 'A password reset must state its reason.');
 
   const { hash, salt } = hashPassword(newPassword);
-  const client = await pool.connect();
+  // Runs inside the actor's tenant transaction: since migration 0010 the officer and grant tables
+  // carry WITH CHECK clauses, so a write made on an unbound connection is refused by the database
+  // rather than silently landing in whichever tenant the row's columns happen to name.
+  const client = await beginTenantTransaction(actor);
   try {
-    await client.query('BEGIN');
     await loadOfficer(client, userId);
     await client.query('UPDATE users SET password_hash = $2, salt = $3 WHERE id = $1', [userId, hash, salt]);
 
@@ -458,21 +469,29 @@ export async function resetOfficerPassword(
 export async function listOfficers(actingPrincipal: RequestPrincipal): Promise<any[]> {
   requirePostgres();
 
-  // A tenant administrator sees their own accounts plus the unowned ones — the latter are the
-  // disposition queue, not another tenant's roster. An identity with no organization at all sees
-  // every account, which is the platform/bootstrap case and is reachable only by an officer holding
-  // USER_ADMIN whose own row carries no tenant.
-  const rows = await pool.query(
+  // Read inside the caller's tenant context. Since migration 0010 the database enforces the same
+  // boundary independently of this clause: an officer sees their own row and their organization's
+  // rows, and nothing else.
+  //
+  // Two behaviours this deliberately no longer has. An account with no organization used to widen the
+  // roster to every account in the system ("the platform case"); it now sees only itself, because a
+  // tenant-less viewer has no tenant to scope to and pretending otherwise made one bootstrap account a
+  // cross-tenant read. And unowned accounts no longer appear as a disposition queue here — they are
+  // invisible everywhere, which is the same rule quarantined parcels already follow. The queue is
+  // owner-side: the one-shot commands and dharohar_verifier, both exempt from row-level security.
+  const rows = await tenantQuery(actingPrincipal,
     `SELECT u.id, u.email, u.role, u.display_name, u.designation, u.badge_number, u.district, u.state, u.organization_id,
             COALESCE((SELECT json_agg(j.district ORDER BY j.district) FROM user_jurisdictions j WHERE j.user_id = u.id AND j.revoked_at IS NULL), '[]') AS jurisdictions,
             COALESCE((SELECT json_agg(c.capability ORDER BY c.capability) FROM user_capabilities c WHERE c.user_id = u.id AND c.revoked_at IS NULL), '[]') AS capabilities
        FROM users u
-       ${actingPrincipal.organizationId ? 'WHERE u.organization_id = $1 OR u.organization_id IS NULL' : ''}
+       WHERE u.organization_id = $1 OR u.id = $2
        ORDER BY u.id`,
-    actingPrincipal.organizationId ? [actingPrincipal.organizationId] : []
+    [actingPrincipal.organizationId ?? '', actingPrincipal.userId]
   );
 
-  // Password hash and salt are never selected, so they cannot be returned by accident either.
+  // The credential columns are not merely unselected here: the runtime role has no SELECT on
+  // users.password_hash or users.salt at all since migration 0010, so no future query added to this
+  // file can bring them back by accident.
   return rows.rows.map((r: any) => ({
     id: r.id,
     email: r.email,

@@ -579,15 +579,46 @@ async function main() {
     `got ${orphanRead.status} ${codeOf(orphanRead)}`);
 
   // A revoked assignment must not survive in the roster as a working account.
-  const revokeB = await call(`/admin/officers/${bUserId}/jurisdictions`, {
+  // An administrator of one tenant reaching into another tenant's accounts. This used to be allowed by
+  // omission — the roster and the grant tables were not scoped to a tenant anywhere. Now the database
+  // refuses it, and the refusal is the same shape as "no such officer", because confirming that an id
+  // exists in another organization is itself a leak.
+  const crossTenantEdit = await call(`/admin/officers/${bUserId}/jurisdictions`, {
     token: admin, method: 'PUT',
-    body: { districts: ['Ajmer'], reason: `Tenancy suite ${run}: drop Jaipur from the second tenant's officer` },
+    body: { districts: ['Ajmer'], reason: `Tenancy suite ${run}: one tenant editing another tenant's officer` },
   });
-  assert(revokeB.status === 200, 'premise: the personal assignment is revoked');
-  const bAfterPersonalRevoke = await call(`/parcels/${otherParcel}`, { token: bToken });
-  assert(bAfterPersonalRevoke.status === 404,
+  assert(crossTenantEdit.status === 404 && codeOf(crossTenantEdit) === 'OFFICER_NOT_FOUND',
+    'an administrator cannot re-assign an officer who belongs to another organization',
+    `got ${crossTenantEdit.status} ${codeOf(crossTenantEdit)}`);
+  const bStillWorks = await call(`/parcels/${otherParcel}`, { token: bToken });
+  assert(bStillWorks.status === 200,
+    'control: the refused edit changed nothing, so the refusal above was not a side effect',
+    `got ${bStillWorks.status}`);
+
+  // The same property, measured where it should hold: inside one tenant, revoking an officer's personal
+  // posting removes their access even while the tenant still holds that district.
+  const revocable = await makeOfficer('revocable', ['Jaipur']);
+  assert(revocable.status === 201, 'premise: a same-tenant officer posted to Jaipur is created', `got ${revocable.status}`);
+  const revocableToken = await login(revocable.email, revocable.password);
+  const beforeRevoke = await call(`/parcels/${demoParcel}`, { token: revocableToken });
+  assert(beforeRevoke.status === 200,
+    'control: before the revocation that officer can read the parcel',
+    `got ${beforeRevoke.status} ${codeOf(beforeRevoke)}`);
+
+  const revokeSame = await call(`/admin/officers/${revocable.id}/jurisdictions`, {
+    token: admin, method: 'PUT',
+    body: { districts: ['Ajmer'], reason: `Tenancy suite ${run}: drop Jaipur inside the caller's own tenant` },
+  });
+  assert(revokeSame.status === 200, 'premise: the personal assignment is revoked inside the same tenant',
+    `got ${revokeSame.status} ${codeOf(revokeSame)}`);
+  const afterRevoke = await call(`/parcels/${demoParcel}`, { token: revocableToken });
+  assert(afterRevoke.status === 404,
     'a personal revocation removes access even while the tenant still holds the district',
-    `got ${bAfterPersonalRevoke.status}`);
+    `got ${afterRevoke.status}`);
+  const adminStillSeesIt = await call(`/parcels/${demoParcel}`, { token: admin });
+  assert(adminStillSeesIt.status === 200,
+    'and the tenant\'s own administrator still sees it, so the record was not hidden by something else',
+    `got ${adminStillSeesIt.status}`);
 
   // ---- 7. authorization reads the database, not the token -------------------
   // A token is an identity claim with a lifetime; a role, a posting and a capability are facts in the
@@ -702,6 +733,172 @@ async function main() {
     'a rolled-back transaction leaves no tenant behind either', `org=${afterRollback.rows[0].org}`);
   borrower4.release();
   await soloPool.end();
+
+  // ---- 9. officer rows are not shared ---------------------------------------
+  // Records were scoped by 0006/0009; this is the other half. An officer list, a district posting, a
+  // capability grant or a password hash belongs to an organization too, and before migration 0010 the
+  // runtime role could read all of it from every tenant at once because authorization had to be able to
+  // find an account before knowing whose it was. The fix is ordering, not an exception: loadPrincipal
+  // now binds the officer id from the verified signature, reads that one row, and only then binds the
+  // organization — so "pre-identity read" survives and "any connection, any row" does not.
+  console.log('\n9. PRINCIPAL DATA (users, postings, capabilities, tenant grants, credentials)');
+  // Its own connection: the one used by section 5 is closed there on purpose, and reusing a released
+  // client would error the suite rather than measure anything.
+  const pc = new Client({ connectionString: APP_URL });
+  await pc.connect();
+  const demoAdminId = (await db.query('select id from users where email = $1', [ADMIN_EMAIL])).rows[0]?.id as string | undefined;
+  const demoOfficerTotal = (await db.query('select count(*)::int n from users where organization_id = $1', [DEMO_TENANT])).rows[0].n as number;
+  const allOfficerTotal = (await db.query('select count(*)::int n from users')).rows[0].n as number;
+  const bOfficerTotal = (await db.query('select count(*)::int n from users where organization_id = $1', [OTHER_TENANT])).rows[0].n as number;
+  assert(!!demoAdminId && demoOfficerTotal >= 1 && bOfficerTotal >= 1 && allOfficerTotal > demoOfficerTotal,
+    'premise: two tenants each hold officer accounts, and the second cannot be the whole table',
+    `admin=${!!demoAdminId} demo=${demoOfficerTotal} other=${bOfficerTotal} total=${allOfficerTotal}`);
+
+  const visibleAsB = async (sql: string) => {
+    await pc.query('BEGIN');
+    await pc.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [OTHER_TENANT, bUserId]);
+    const rows = await pc.query(sql);
+    await pc.query('ROLLBACK');
+    return rows;
+  };
+
+  const usersSeen = (await visibleAsB('select id, email, organization_id from users')).rows;
+  assert(usersSeen.length > 0 && usersSeen.every((r: any) => r.organization_id === OTHER_TENANT),
+    'the second tenant reading users sees officers and only sees its own',
+    `rows=${usersSeen.length} foreign=${usersSeen.filter((r: any) => r.organization_id !== OTHER_TENANT).length}`);
+  assert(!usersSeen.some((r: any) => r.id === demoAdminId),
+    'the first tenant\'s administrator is not among them', JSON.stringify(usersSeen.map((r: any) => r.id).slice(0, 6)));
+  assert(usersSeen.length < allOfficerTotal,
+    'and that is a real reduction, not a query that happened to return the whole table',
+    `visible=${usersSeen.length} of ${allOfficerTotal}`);
+
+  const postingsSeen = (await visibleAsB('select user_id, district from user_jurisdictions')).rows;
+  assert(postingsSeen.length > 0 && postingsSeen.every((r: any) => r.user_id !== demoAdminId),
+    'district postings are readable for its own officers and absent for the other tenant\'s',
+    `rows=${postingsSeen.length}`);
+  const adminPostings = (await db.query('select count(*)::int n from user_jurisdictions where user_id = $1 and revoked_at is null', [demoAdminId])).rows[0].n as number;
+  assert(adminPostings > 0, 'premise: the first tenant\'s administrator really does hold a live posting to hide', `got ${adminPostings}`);
+
+  const capsSeen = (await visibleAsB('select user_id, capability from user_capabilities')).rows;
+  assert(!capsSeen.some((r: any) => r.user_id === demoAdminId),
+    'another tenant\'s capability grants are not enumerable', JSON.stringify(capsSeen.slice(0, 4)));
+  const adminCaps = (await db.query('select count(*)::int n from user_capabilities where user_id = $1 and revoked_at is null', [demoAdminId])).rows[0].n as number;
+  assert(adminCaps > 0, 'premise: that administrator does hold a live capability (USER_ADMIN) to be hidden', `got ${adminCaps}`);
+
+  const grantsSeen = (await visibleAsB('select organization_id, relationship from organization_districts')).rows;
+  assert(grantsSeen.length > 0 && grantsSeen.every((r: any) => r.organization_id === OTHER_TENANT),
+    'the tenant-district authority map is readable only for the caller\'s own tenant',
+    JSON.stringify({ rows: grantsSeen.length, orgs: [...new Set(grantsSeen.map((r: any) => r.organization_id))] }));
+  const demoGrants = (await db.query('select count(*)::int n from organization_districts where organization_id = $1 and revoked_at is null', [DEMO_TENANT])).rows[0].n as number;
+  assert(demoGrants > 0, 'premise: the first tenant has live district grants that the second cannot see', `got ${demoGrants}`);
+
+  // The credential columns are a separate control from the row scope: even for a row this role may see,
+  // it may not read a hash. Both refusals are privilege errors, so the assertion is about the privilege
+  // table as well as the attempt.
+  const colPrivs = await pc.query(
+    `select has_column_privilege('dharohar_app','public.users','password_hash','SELECT') as hash,
+            has_column_privilege('dharohar_app','public.users','salt','SELECT') as salt,
+            has_column_privilege('dharohar_app','public.users','organization_id','SELECT') as org_col,
+            has_table_privilege('dharohar_app','public.users','UPDATE') as can_update`);
+  assert(colPrivs.rows[0]?.hash === false && colPrivs.rows[0]?.salt === false,
+    'the runtime role cannot read the credential columns of users at all', JSON.stringify(colPrivs.rows[0]));
+  const hashAttempt = await (async () => {
+    try { const r = await pc.query('select password_hash from users limit 1'); return `returned ${r.rowCount} rows`; }
+    catch (err: any) { return /permission denied/.test(String(err.message)) ? 'refused' : String(err.message).slice(0, 60); }
+  })();
+  assert(hashAttempt === 'refused', 'and a direct attempt to read a hash is refused by PostgreSQL', hashAttempt);
+  assert(colPrivs.rows[0]?.org_col === true && colPrivs.rows[0]?.can_update === true,
+    'control: the columns and the write that provisioning legitimately needs are still granted',
+    JSON.stringify(colPrivs.rows[0]));
+
+  // The login lookup is the one sanctioned pre-identity read. It must stay an exact-match lookup and
+  // must not degrade into a search.
+  const byWildcard = await pc.query(`select count(*)::int n from dharohar_officer_for_login('%')`);
+  assert(Number(byWildcard.rows[0]?.n ?? -1) === 0,
+    'the identity lookup cannot be used as a wildcard search', `got ${byWildcard.rows[0]?.n}`);
+  const byEmail = await pc.query(`select id, email from dharohar_officer_for_login($1)`, [`tenant-b.${run}@dharohar.test`]);
+  assert(byEmail.rows.length === 1 && byEmail.rows[0].id === bUserId,
+    'and it still resolves the one account a person signs in with', JSON.stringify(byEmail.rows));
+  const identityAttrs = await pc.query(
+    `select rolcanlogin, rolsuper, rolbypassrls from pg_roles where rolname = 'dharohar_identity'`);
+  assert(identityAttrs.rows.length === 1 && identityAttrs.rows[0].rolcanlogin === false
+    && identityAttrs.rows[0].rolsuper === false && identityAttrs.rows[0].rolbypassrls === true,
+    'the role that owns that lookup cannot log in and is not a superuser (its only privilege is seeing past RLS)',
+    JSON.stringify(identityAttrs.rows[0] ?? 'no such role'));
+  const membership = await pc.query(`select pg_has_role('dharohar_app','dharohar_identity','MEMBER') as member`);
+  assert(membership.rows[0]?.member === false,
+    'and the runtime role is not a member of it, so BYPASSRLS cannot be inherited',
+    String(membership.rows[0]?.member));
+
+  // The honest boundary of layer two, measured rather than described. These GUCs belong to the session,
+  // so the runtime role can assert a tenant with no token involved. What 0010 closes is the *unbound*
+  // read; a policy keyed on a value the connection itself writes is not a wall against that connection —
+  // it is a wall against a query that forgot its WHERE clause. Asserting this keeps the documentation
+  // honest in both directions: forging a context cannot reach another tenant's rows, and it does not
+  // open the record tables either, because those require a session user that resolves in users.
+  await pc.query(`select set_config('app.organization_id', $1, false)`, [OTHER_TENANT]);
+  const sessionAsserted = await pc.query(
+    `select count(*)::int as seen, count(*) filter (where organization_id is distinct from $1) as foreign_rows
+       from users`, [OTHER_TENANT]);
+  const sessionParcels = await pc.query('select count(*)::int as n from parcels');
+  await pc.query('reset app.organization_id');
+  const afterReset = await pc.query('select count(*)::int as n from users');
+  assert(Number(sessionAsserted.rows[0]?.seen ?? -1) === bOfficerTotal,
+    'a self-asserted context opens exactly that tenant\'s officers, not the estate',
+    `seen ${sessionAsserted.rows[0]?.seen}, the second tenant has ${bOfficerTotal}`);
+  assert(Number(sessionAsserted.rows[0]?.foreign_rows ?? -1) === 0,
+    'and not one row of another tenant comes with it', JSON.stringify(sessionAsserted.rows[0]));
+  assert(Number(sessionParcels.rows[0]?.n ?? -1) === 0,
+    'with an organization asserted but no user, the record tables stay shut (the two-part predicate)',
+    `parcels visible ${sessionParcels.rows[0]?.n}`);
+  assert(Number(afterReset.rows[0]?.n ?? -1) === 0,
+    'after the session resets its own context, the unbound read is zero again',
+    `users visible ${afterReset.rows[0]?.n}`);
+
+  // What 0010 does NOT close, pinned so a change is visible instead of assumed. The login lookup is
+  // SECURITY DEFINER, so for one exact identifier it hands back that officer's row including the
+  // credential columns the role cannot read from the table. Enumeration is gone; a targeted lookup by a
+  // known identifier is the remaining cross-tenant read, and it is the reason the docs say "no
+  // unrestricted officer reads" rather than "tenant isolation is complete".
+  const oracle = await pc.query(
+    `select count(*)::int as n, length(max(password_hash)) as hash_len,
+            count(*) filter (where organization_id = $1) as in_other_tenant
+       from dharohar_officer_for_login($2)`, [DEMO_TENANT, ADMIN_EMAIL]);
+  assert(Number(oracle.rows[0]?.n ?? -1) === 1,
+    'premise: the identity lookup still resolves the first tenant\'s administrator by exact email',
+    JSON.stringify(oracle.rows[0]));
+  assert(Number(oracle.rows[0]?.in_other_tenant ?? -1) === 1,
+    'and it does so across the tenant boundary — this is the sanctioned login path, not the roster',
+    JSON.stringify(oracle.rows[0]));
+  assert(Number(oracle.rows[0]?.hash_len ?? 0) > 0,
+    'RESIDUAL, asserted on purpose: through that function the role can read the credential column of one named officer',
+    `hash_len ${oracle.rows[0]?.hash_len}`);
+
+  // Roster through the API: an administrator of the second tenant must not be able to list the first.
+  await db.query(
+    `insert into user_capabilities (user_id, capability, granted_by)
+     values ($1, 'USER_ADMIN', 'tenancy-suite') on conflict (user_id, capability)
+       do update set revoked_at = null, granted_by = 'tenancy-suite'`,
+    [bUserId]);
+  const bRoster = await call('/admin/officers', { token: bToken });
+  const bRosterList: any[] = bRoster.body?.data?.officers || [];
+  assert(bRoster.status === 200, 'premise: the second tenant\'s officer is now an administrator of its own tenant', `got ${bRoster.status}`);
+  assert(bRosterList.length >= 1 && bRosterList.every((o: any) => o.organizationId === OTHER_TENANT),
+    'its roster contains its own organization only', JSON.stringify({ rows: bRosterList.length, orgs: [...new Set(bRosterList.map((o: any) => o.organizationId))] }));
+  assert(!bRosterList.some((o: any) => o.id === demoAdminId || o.email === ADMIN_EMAIL),
+    'the first tenant\'s administrator is not in it, by id or by email', JSON.stringify(bRosterList.map((o: any) => o.id)));
+  await db.query(`update user_capabilities set revoked_at = NOW() where user_id = $1 and capability = 'USER_ADMIN'`, [bUserId]);
+
+  // An account with no organization used to widen the roster to every account in the system. It now
+  // sees exactly itself, which is what "no tenant" has always meant on the record side.
+  await db.query(`insert into user_capabilities (user_id, capability, granted_by) values ($1,'USER_ADMIN','tenancy-suite') on conflict (user_id, capability) do update set revoked_at = null`, [orphan.id]);
+  const orphanRoster = await call('/admin/officers', { token: orphanToken });
+  const orphanList: any[] = orphanRoster.body?.data?.officers || [];
+  assert(orphanRoster.status === 200 && orphanList.length === 1 && orphanList[0]?.id === orphan.id,
+    'a tenant-less administrator lists only their own account, not the whole estate',
+    JSON.stringify({ status: orphanRoster.status, rows: orphanList.length }));
+  await db.query(`update user_capabilities set revoked_at = NOW() where user_id = $1 and capability = 'USER_ADMIN'`, [orphan.id]);
+  await pc.end();
 
   // ---- teardown on the copy --------------------------------------------------
   try {

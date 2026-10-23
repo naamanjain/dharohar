@@ -229,10 +229,18 @@ chk "the bootstrap command refuses to run a second time" "4" "$([ $rc -eq 4 ] &&
 chk "and says why" "1" "$(has 'already holds the USER_ADMIN capability' "$out")"
 chk "no second administrator was created" "0" "$(fq "$FRESH" "select count(*) from users where email='fresh2.$SUF@dharohar.test'")"
 # And the fresh database must be tenant-scoped from the first migration, not only after an upgrade.
-# Five tables: the two roots (0006) and the three child tables that inherit their parcel's tenant (0009).
-RLS_TABLES="'parcels','land_documents','parcel_owners','parcel_mutations','field_inspections'"
-chk "row-level security is present on a fresh install" "5" "$(fq "$FRESH" "select count(*) from pg_class where relname in ($RLS_TABLES) and relrowsecurity")"
-chk "every tenant-scoped table carries all four policies" "5" "$(fq "$FRESH" "select count(distinct tablename) from pg_policies where policyname like 'tenant_%'")"
+# Nine tables now: the two roots (0006), the three child tables that inherit their parcel's tenant
+# (0009), and the four authorization tables that hold officers, postings, capabilities and tenant
+# grants (0010). This line read "5" until 2026-10-23, when a fresh install proved it: an assertion
+# pinned to the old number fails the gate for the right reason only if someone also checks that the
+# new five are complete — so the set difference below is the part that actually holds the line.
+RLS_TABLES="'parcels','land_documents','parcel_owners','parcel_mutations','field_inspections','users','user_jurisdictions','user_capabilities','organization_districts'"
+chk "row-level security is present on a fresh install" "9" "$(fq "$FRESH" "select count(*) from pg_class where relname in ($RLS_TABLES) and relrowsecurity")"
+chk "every tenant-scoped table carries all four policies" "9" "$(fq "$FRESH" "select count(distinct tablename) from pg_policies where policyname like 'tenant_%'")"
+# The two lists must be the same list. A table that is under RLS with no tenant policy is a table whose
+# protection is a comment, and a policy on a table that is not under RLS is a policy that is not run.
+chk "and no RLS table is missing its policies, or the other way round" "0" \
+    "$(fq "$FRESH" "select (select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relrowsecurity and c.relname not in (select distinct tablename from pg_policies where policyname like 'tenant_%')) + (select count(*) from (select distinct tablename from pg_policies where policyname like 'tenant_%') t where not exists (select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname=t.tablename and c.relrowsecurity))")"
 chk "no table has a partial policy set" "0" \
     "$(fq "$FRESH" "with p as (select tablename, count(*) n from pg_policies where policyname like 'tenant_%' group by tablename) select count(*) from p where n <> 4")"
 

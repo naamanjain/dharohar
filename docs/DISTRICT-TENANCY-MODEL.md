@@ -565,3 +565,160 @@ work. The environment is still synthetic-only and still private: no public port,
   credential without a tenant bound, because login must resolve them first. The residual exposure is
   named in `docs/TENANT-DATA-ACCESS.md` rather than argued away; narrowing it means a second identity for
   authentication reads, which is a role-design change and a decision for the owner.
+  *(Superseded on 2026-10-23 by migration 0010 — see §15. The last clause is still true: what 0010 needed
+  was a narrow definer function, and what would close the remainder is a separate authentication identity.)*
+
+---
+
+## 15. What was executed on 2026-10-23/24 (0010 principal isolation, a credential rotation, and the encrypted archive)
+
+Four tasks, and two of them produced defects in my own earlier work rather than in the product.
+
+### 15a. Migration 0010 — the officer tables stopped being the exception
+
+The bullet above was the largest remaining cross-tenant read: `select count(*) from users` as
+`dharohar_app` returned **59** rows on the deployed demo database, every account of every tenant, on
+every request, before any authorization ran. 0010 closes it three ways, and each way is measured:
+
+| change | measured effect |
+| --- | --- |
+| RLS on `users`, `user_jurisdictions`, `user_capabilities`, `organization_districts` — 4 policies each, predicate *own row or own organization* | `select count(*) from users` as the runtime role: **59 → 0**; with a context bound, only that tenant's officers, and 0 rows of any other tenant |
+| `REVOKE SELECT ON public.users`, then `GRANT SELECT` on the 17 non-credential columns | `select password_hash from users` → `permission denied for table users`; `has_column_privilege` false for `password_hash` and `salt`, true for the other 17 — and `information_schema.column_privileges` under-reports this as 1 of 19, which is why the predicate, not the view, is the authority |
+| `dharohar_officer_for_login(text)` / `dharohar_has_any_officer()`, `SECURITY DEFINER`, owned by a **NOLOGIN** `dharohar_identity`, `search_path` pinned, EXECUTE granted to exactly one role | login still resolves an officer by email, id or badge; `%` as an identifier returns 0 rows, so the function is not a search |
+
+`listOfficers` also lost its two pre-0010 behaviours, both of which were cross-tenant reads wearing an
+application-layer excuse: a tenant-less administrator used to be shown **every account in the system**,
+and unowned accounts used to be appended to every tenant's roster as a "disposition queue". Both are
+owner-side now (`scripts/assignOwnership.ts`), and the roster is scoped to `organization_id = $1`.
+`PUT /admin/officers/:id/jurisdictions` for a foreign officer now answers `404 OFFICER_NOT_FOUND` —
+indistinguishable from a row that does not exist — which is the point of the change, and the suite
+asserts it as a security property with a control that the same officer's own parcel is still readable.
+
+Two things the write path needed that the first pass missed: every provisioning and registry transaction
+now begins with `beginTenantTransaction(actor)` instead of a raw `BEGIN`, because 0010's `WITH CHECK`
+clauses refuse an insert whose organization is not the bound one; and `listDistricts` without a principal
+no longer publishes zero counts — it checks whether the connected identity is exempt from RLS
+(`rolsuper`/`rolbypassrls` against `relrowsecurity`) and otherwise raises `PRINCIPAL_REQUIRED`, because
+an RLS-blind aggregate is the same lie as an RLS-blind integrity checker.
+
+### 15b. Two defects 0010's self-check had, both found by running a gate that used to pass
+
+1. **It asserted privileges that `roles.sql` had not granted yet.** The supported order is
+   `migrate` → `roleinit`, so on any new database `dharohar_app` holds nothing when 0010 runs — and the
+   abort `[PRINCIPAL_ISOLATION_INCOMPLETE] provisioning can no longer UPDATE users at all` broke
+   `npm run test:registry` (40 passed, 14 failed) and the documented fresh install. The privilege half is
+   now taken only when the lockdown is actually in place, and `roles.sql` §3c remains the hard enforcer
+   (`[ROLES_LOCKDOWN_FAILED]` if a credential column stays readable), applied on every `up`.
+2. **The first fix used a predicate the migration satisfies itself.** `has_any_column_privilege(… users
+   …)` became true because section 4 of 0010 grants those column privileges minutes earlier in the same
+   file — so the branch still ran the assertions and the same abort reappeared. The discriminator is now
+   `has_table_privilege('dharohar_app','public.parcels','SELECT')`, which only `roles.sql` can set. A
+   check whose precondition is produced by the code it guards is not a check; `has_table_privilege` on
+   `users` would have been wrong in the other direction too, because after the column split it answers
+   *false on a correctly locked-down database*.
+
+Applying the corrected file to the live demo database meant `rollback-0010` → rebuild → re-apply, with
+the API stopped for the window (the rollback prints a `WARNING:` that the credential columns become
+readable again — it refuses outright if any policy on those tables was not created by 0010). Ledger is
+`0001…0010`, checksum `sha256:e36ccec9d3…`, and `run --rm migrate` afterwards says
+"No pending migrations. 10 applied, schema up to date (no-op)", which is what proves the recorded
+checksum matches the file rather than merely that a run exited 0.
+
+### 15c. The exposed application credential was rotated, in both directions
+
+`DHAROHAR_APP_PASSWORD` had been printed twice — once by a `docker inspect`, once by a "names only"
+filter over the rendered compose file that failed because YAML renders `DATABASE_URL: value`, not
+`KEY=value`. `scripts/rotate-app-credential.sh` now does the rotation with rails on, and this is what it
+measured: the injection map (one source in `.env`, three live holders, and the API container holding the
+value in `DATABASE_URL` and `PGPASSWORD` but **not** in `DHAROHAR_APP_PASSWORD` — its digest there was the
+empty string), the pre-rotation SCRAM verifier digest `d29e4294…` → post-rotation `ee2f310a…`, every
+*other* secret's digest unchanged before and after (`88b98d72b991` both sides, and the file grew by
+exactly the length difference, 574 → 606 bytes), the old credential refused with
+`FATAL: password authentication failed for user "dharohar_app"`, the new one authenticating, then the
+API recreated and `/api/health/ready` returning 200 — the endpoint that probes the database live, unlike
+`/api/health`, which reports the boot mode. Neither value was ever printed, passed as an argument, or
+written to a file; the tests piped them through `psql -W` on stdin. (`-w` is the opposite of `-W`: it
+means never prompt, and every attempt then fails with `fe_sendauth: no password supplied`.)
+
+The value is not in the working tree, not in any commit, and not in the session logs — checked by
+matching each live value against every file and every blob of the last four commits, with a control that
+plants a real value in memory to prove the matcher can see one and a placeholder of the same shape to
+prove it does not cry wolf.
+
+### 15d. The encrypted archive leg, and the sync surprise underneath it
+
+`scripts/encrypted-backup-drill.sh` runs green (38 checks, exit 0) and its two script defects were the
+interesting part: `openssl enc -salt 16` is invalid in OpenSSL 3.5 (`-salt` is a flag; the length option
+is `-saltlen`), and the script's own `MSYS_NO_PATHCONV=1` made native `openssl.exe` and `docker.exe`
+unable to see a `mktemp -d` path under `/tmp`. Both produced a **failing** run rather than a false pass,
+which is the point — but the check that consumed them (`digest` of a missing file, `grep -c` of a missing
+file) would have passed vacuously, so the file-existence and size premises are now asserted before
+anything is compared.
+
+The drill proves the encryption is real functionally, not by pattern-matching: `pg_restore --list` reads
+the **plaintext** archive's manifest with no key and lists `TABLE DATA public parcels`, and fails on the
+ciphertext with *"input file does not appear to be a valid archive"*. Then decrypt → restore → compare:
+ledger `0001…0010` identical, 43 parcels / 47 documents / 59 officers / 4 grants / 2,520 audit entries /
+44 co-sharers all matching, 31 owner-tagged parcels, 43/43 valid geometries, RLS still enabled on the
+restored `parcels`, the largest document payload md5 equal on both sides, and the whole audit chain
+folding to the same md5 (`a5e9148a…`).
+
+**What the measurement turned up that nobody had asked about:** the repository lives at
+`C:\Users\allin\OneDrive\Desktop\AI\DHAROHAR`, the Desktop known folder is redirected into OneDrive, and
+the OneDrive sync-root marker is present — so `backups/`, holding **69 unencrypted dumps**, sits inside a
+sync root. The client was not running and had no account configured when I checked, so nothing is proven
+to have left the machine and nothing can be proven not to have. `scripts/backup.sh` now prints a
+`WARNING:` when its resolved output directory is under a cloud-sync path (proved in both directions: it
+fires here, silent under `C:\temp-dh-backup`), and the retention/destination/credential rules are written
+into `docs/DEPLOYMENT.md` §8. **The transfer leg is NOT EXECUTED:** `rclone`, `restic` and the AWS CLI
+are all absent, no network share is mapped, and there are no credentials for any destination — so real
+off-machine recovery is still an owner action, and this phase does not claim it is done.
+
+### 15e. The fourth script 0010 made blind, and it was a maintenance script
+
+`validate-stack.sh` went from "66 passed, 1 failed" to **66 passed, 3 failed** after 0010 landed, and two
+of the three were one new defect: `server/src/retireSuiteResidue.ts` — the step that retires the officers
+the gate itself creates — stopped finding any administrator at all (`exit 4`, "no usable USER_ADMIN officer
+found") and then, once that was fixed, reported "no row in `users` matches `%@dharohar.test`".
+
+Neither was true. The live table holds one active `USER_ADMIN` (`USR-SYSADM-01`) and **54**
+suite-created officers, all owned by `ORG-DHAROHAR-DEMO`. The script ran inside the API container, as
+`dharohar_app`, with an **unbound** `pool.query` — and unbound is exactly what 0010 made return zero
+rows. This is the fourth time in this project that a check asked a question of an identity that could not
+see the answer (after the integrity checker's 41 invented orphans, the registry's zero counts, and the
+audit-chain view). Two fixes, both in the shape the application already uses:
+
+* a named administrator is resolved through `loadPrincipal`, which since this phase falls back to
+  `dharohar_officer_for_login(email)` — the one sanctioned pre-context read — instead of enumerating;
+* the candidate scan runs through `tenantQuery(actor, …)`, so the actor's own organization is bound and
+  its tenant's residue becomes visible.
+
+Where the scan still returns nothing, the script now says it *cannot distinguish* "there is nothing to
+retire" from "the residue belongs to a tenant I am not allowed to read", and names the identity that can
+settle it (the schema owner through `maint`). The measured difference: dry run **0 candidates → 54
+candidates**, then `RESIDUE_APPLY=true` → "54 account(s) revoked and locked", nothing deleted, every
+change written into the audit chain attributed to the officer who ran it.
+
+One consequence worth stating for a multi-tenant deployment: **retiring another tenant's residue is not
+something this script can or should do from inside one tenant's identity.** Either each tenant's
+administrator retires their own fixtures, or the owner-role runs it through `maint`.
+
+### 15f. Gates re-run after all of the above
+
+Every row is this phase's own run, with the exit code recorded. Two of them went red *because of* 0010
+and are described in §15b and §15e; the rest were green before and are green now.
+
+| gate | result |
+| --- | --- |
+| `npm run lint` (`tsc --noEmit`) | exit 0 |
+| `npm test` — i18n, ocr, phase 4, E2E | phase 4 **47 passed / 0 failed**, E2E **53 / 0**, exit 0 |
+| `scripts/test-authorization-on-copy.sh` on a restored copy | jurisdiction **46 / 0**, provisioning **91 / 0**, tenancy **101 / 0** (was 94; §9 grew by the seven principal-isolation assertions), exit 0 |
+| `scripts/test-tenant-migration.sh` | **141 passed / 0 failed**, exit 0 — 0010 apply, idempotence, rollback, rollback guards |
+| `scripts/test-fresh-install.sh` | **all checks passed** (106 assertions), exit 0 — including 0010 on a database built from nothing, and the new RLS-coverage set difference |
+| `npm run test:registry` | **56 / 0**, exit 0 — after its phase A was corrected to the documented two-pass install |
+| `scripts/encrypted-backup-drill.sh` | **38 checks**, exit 0 |
+| `scripts/rotate-app-credential.sh` | exit 0 — old credential refused, new one authenticates, every other secret's digest unchanged |
+| live demo database, re-measured | 16 policies across 9 RLS tables, ledger `0001…0010`, `select count(*) from users` as `dharohar_app` = **0**, `select password_hash from users` = `permission denied`, `dharohar_officer_for_login('rj-audit-2015-0012')` = 1 row, `/api/health/ready` = 200 |
+| `./scripts/validate-stack.sh` | **68 passed, 1 failed** of 69 checks — the one failure is the `ADMIN_PASSWORD` skip (§6 of `docs/OWNER-HANDOFF.md`); the two retirement failures this phase introduced are fixed in §15e above |
+| `verify dist-server/verify_audit_chain.js` as `dharohar_verifier` | exit 0 — **2,874 entries** walked, ids contiguous, verdict **INTACT** |
+| the register after all of it | 45 parcels (33 owned, 12 quarantined), 51 documents (2 with payload), 59 accounts (all owned), 46 co-sharers, 16 mutations, 4 tenant grants, 16 districts |

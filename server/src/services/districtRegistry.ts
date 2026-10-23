@@ -13,7 +13,7 @@
  */
 
 import { pool, getDbHealth } from '../db/db';
-import { tenantQuery } from '../db/tenant';
+import { beginTenantTransaction, tenantQuery } from '../db/tenant';
 import { recordAuditLog } from './auditService';
 import { mayProvisionOfficers } from './jurisdiction';
 import type { RequestPrincipal } from './jurisdiction';
@@ -83,14 +83,34 @@ export async function listDistricts(principal?: RequestPrincipal): Promise<Distr
                     ${scoped ? 'AND u.organization_id = $1' : ''}) AS officers
            FROM districts d ORDER BY lower(d.name), d.code`,
         orgParams)
-    : await pool.query(
-        `SELECT d.code, d.name, d.organization_id, d.provenance, d.kind, d.is_active,
-                (SELECT count(*)::int FROM parcels p WHERE p.district_code = d.code) AS parcels,
-                (SELECT count(*)::int FROM land_documents l WHERE l.district_code = d.code) AS documents,
-                (SELECT count(*)::int FROM user_jurisdictions j
-                  WHERE j.district_code = d.code AND j.revoked_at IS NULL) AS officers
-           FROM districts d ORDER BY lower(d.name), d.code`
-      );
+    : await (async () => {
+        // No caller means the one-shot services, which connect as an identity exempt from row-level
+        // security, and the counts are the platform-wide totals they have always been. Since migration
+        // 0010 that exemption is what makes the totals true: a runtime-role connection with no tenant
+        // bound would report `officers = 0` for every district and present it as a fact. Refuse the
+        // identity rather than publish a number it cannot see.
+        const identity = await pool.query(
+          `SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                   OR (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user) AS exempt,
+               (SELECT relrowsecurity FROM pg_class WHERE oid = 'user_jurisdictions'::regclass) AS scoped`
+        );
+        if (identity.rows[0]?.scoped === true && identity.rows[0]?.exempt !== true) {
+          throw new RegistryRejected(
+            'PRINCIPAL_REQUIRED',
+            'The registry counts cannot be produced honestly without a caller: this database identity is ' +
+              'subject to row-level security over the officer and record tables, so every count would read ' +
+              'zero and be presented as a total.'
+          );
+        }
+        return pool.query(
+          `SELECT d.code, d.name, d.organization_id, d.provenance, d.kind, d.is_active,
+                  (SELECT count(*)::int FROM parcels p WHERE p.district_code = d.code) AS parcels,
+                  (SELECT count(*)::int FROM land_documents l WHERE l.district_code = d.code) AS documents,
+                  (SELECT count(*)::int FROM user_jurisdictions j
+                    WHERE j.district_code = d.code AND j.revoked_at IS NULL) AS officers
+             FROM districts d ORDER BY lower(d.name), d.code`
+        );
+      })();
   return result.rows.map((r: any) => ({
     code: r.code,
     name: r.name,
@@ -144,9 +164,11 @@ export async function declareDistrict(
   const relationship = requestedRelationship as DistrictRelationship;
 
   let granted = false;
-  const client = await pool.connect();
+  // Inside the acting officer's tenant transaction: since migration 0010 the tenant-district grant
+  // table carries a WITH CHECK clause, so a declaration written on an unbound connection is refused
+  // by the database instead of landing in whichever organization the column happens to name.
+  const client = await beginTenantTransaction(principal);
   try {
-    await client.query('BEGIN');
 
     const existing = await client.query('SELECT code, kind FROM districts WHERE code = $1 FOR UPDATE', [code]);
     if ((existing.rowCount ?? 0) > 0) {
@@ -295,9 +317,11 @@ export async function promoteDistrict(
     );
   }
 
-  const client = await pool.connect();
+  // Inside the acting officer's tenant transaction: since migration 0010 the tenant-district grant
+  // table carries a WITH CHECK clause, so a declaration written on an unbound connection is refused
+  // by the database instead of landing in whichever organization the column happens to name.
+  const client = await beginTenantTransaction(principal);
   try {
-    await client.query('BEGIN');
     const found = await client.query('SELECT code, kind FROM districts WHERE code = $1 FOR UPDATE', [key]);
     if ((found.rowCount ?? 0) === 0) {
       throw new RegistryRejected('DISTRICT_NOT_FOUND', `District ${key} is not registered.`, { code: key });
@@ -371,9 +395,11 @@ export async function setDistrictActive(
     );
   }
 
-  const client = await pool.connect();
+  // Inside the acting officer's tenant transaction: since migration 0010 the tenant-district grant
+  // table carries a WITH CHECK clause, so a declaration written on an unbound connection is refused
+  // by the database instead of landing in whichever organization the column happens to name.
+  const client = await beginTenantTransaction(principal);
   try {
-    await client.query('BEGIN');
     const found = await client.query('SELECT code, is_active FROM districts WHERE code = $1 FOR UPDATE', [key]);
     if ((found.rowCount ?? 0) === 0) {
       throw new RegistryRejected('DISTRICT_NOT_FOUND', `District ${key} is not registered.`, { code: key });

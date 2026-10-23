@@ -5,6 +5,7 @@ import { verifyPassword, createJwtToken } from '../utils/crypto';
 import { authenticateToken } from '../middleware/auth';
 import { recordAuditLog } from '../services/auditService';
 import { loadPrincipal } from '../services/jurisdiction';
+import { tenantQuery } from '../db/tenant';
 
 export const authRouter = Router();
 
@@ -77,10 +78,11 @@ authRouter.post('/login', async (req: Request, res: Response) => {
     try {
       const client = await pool.connect();
       try {
-        const result = await client.query(
-          'SELECT * FROM users WHERE LOWER(email) = $1 OR id = $2 OR LOWER(badge_number) = $1 LIMIT 1',
-          [loginIdentifier, loginIdentifier.toUpperCase()]
-        );
+        // The one place in the system that may find an account before its tenant is known. Since
+        // migration 0010 the runtime role cannot SELECT the credential columns directly at all, so
+        // signing in goes through this narrow lookup: one exact identifier, at most one row, and no
+        // way to list or search principals.
+        const result = await client.query('SELECT * FROM dharohar_officer_for_login($1)', [loginIdentifier]);
         if (result.rows.length > 0) {
           const row = result.rows[0];
           user = {
@@ -241,9 +243,12 @@ authRouter.get('/me', authenticateToken, async (req: Request, res: Response) => 
   // in production would let a deployed instance answer /me from a source no administrator controls.
   if (getDbHealth().storageMode === 'postgres-postgis') {
     try {
-      const result = await pool.query(
-        'SELECT designation, jurisdiction, state FROM users WHERE id = $1 OR email = $2 LIMIT 1',
-        [tokenUser.userId, tokenUser.email]
+      // Read through the caller's own tenant context. `users` is row-level-security scoped since
+      // migration 0010, and this is a read of one's own row — an unbound query would legitimately see
+      // nothing and would answer /me with a profile missing the officer's own designation.
+      const result = await tenantQuery(req.principal!,
+        'SELECT designation, jurisdiction, state FROM users WHERE id = $1',
+        [req.principal!.userId]
       );
       if (result.rows.length > 0) {
         userProfile = {
