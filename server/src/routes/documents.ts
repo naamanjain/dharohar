@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { PoolClient } from 'pg';
 import { memoryStore, getDbHealth, pool } from '../db/db';
-import { authenticateToken, requireRole } from '../middleware/auth';
+import { authenticateToken, denyReadOnly, requireRole } from '../middleware/auth';
 import { recordAuditLog } from '../services/auditService';
 import { sha256 } from '../utils/crypto';
 import { mapDocumentRow, normaliseOwner, setDocumentParcelLink } from '../services/parcelService';
@@ -208,6 +208,7 @@ documentsRouter.get('/:id', authenticateToken, async (req: Request, res: Respons
 documentsRouter.post(
   '/:id/link',
   authenticateToken,
+  denyReadOnly,
   requireRole('TEHSILDAR', 'PATWARI', 'DATA_ENTRY_OPERATOR'),
   async (req: Request, res: Response) => {
     const { id } = req.params;
@@ -274,6 +275,7 @@ documentsRouter.post(
 documentsRouter.post(
   '/',
   authenticateToken,
+  denyReadOnly,
   requireRole('TEHSILDAR', 'PATWARI', 'DATA_ENTRY_OPERATOR'),
   async (req: Request, res: Response) => {
     const body = req.body ?? {};

@@ -5,7 +5,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyJwtToken } from '../utils/crypto';
 import { AuthTokenPayload, UserRole } from '../types/backend';
-import { RequestPrincipal, loadPrincipal } from '../services/jurisdiction';
+import { RequestPrincipal, isReadOnlyRole, loadPrincipal } from '../services/jurisdiction';
 
 // Extend Express Request interface to include user
 declare global {
@@ -81,11 +81,31 @@ export function authenticateToken(req: Request, res: Response, next: NextFunctio
 }
 
 /**
+ * Read-only roles may look but never change. Kept as a separate gate from role lists and from
+ * jurisdiction so an auditor's oversight reads are not confused with mutation rights, and so that
+ * adding a new write role to a `requireRole` list cannot silently make auditors writers.
+ */
+export function denyReadOnly(req: Request, res: Response, next: NextFunction) {
+  if (req.principal && isReadOnlyRole(req.principal)) {
+    return res.status(403).json({
+      success: false,
+      error: { code: 'READ_ONLY_ROLE', message: 'Auditors have read-only access to the registry.' },
+    });
+  }
+  next();
+}
+
+/**
  * Enforces role-based permissions on protected endpoints
  */
 export function requireRole(...allowedRoles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction) => {
-    if (!req.user) {
+    // Read from the principal loaded from the database on THIS request, never from the role signed
+    // into the token. A token stays valid until it expires, so an officer demoted out of SYSTEM_ADMIN
+    // — or out of the tenant entirely — would otherwise keep exercising the old role for the rest of
+    // the token's life. `req.user` is kept for identity only.
+    const principal = req.principal;
+    if (!principal) {
       return res.status(401).json({
         success: false,
         error: {
@@ -95,12 +115,12 @@ export function requireRole(...allowedRoles: UserRole[]) {
       });
     }
 
-    if (!allowedRoles.includes(req.user.role)) {
+    if (!allowedRoles.includes(principal.role)) {
       return res.status(403).json({
         success: false,
         error: {
           code: 'FORBIDDEN',
-          message: `Access denied. Role '${req.user.role}' is not authorized for this operation. Required: [${allowedRoles.join(', ')}].`,
+          message: `Access denied. Role '${principal.role}' is not authorized for this operation. Required: [${allowedRoles.join(', ')}].`,
         },
       });
     }

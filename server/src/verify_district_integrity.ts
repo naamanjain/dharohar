@@ -146,13 +146,32 @@ async function main() {
   ));
 
   // ---- 6. Officer assignments -------------------------------------------------
+  // Each row states WHAT WAS MEASURED about the account, not just that it is locked out: whether the
+  // grants were revoked (which means a live assignment existed and was withdrawn) or never granted at
+  // all, and whether a retirement was written into the audit chain. "Officer can reach nothing" is a
+  // fact about the present; the difference between a retired suite fixture and an administrator whose
+  // access was lost by accident is the whole point, and it has to be visible in the report rather than
+  // investigated by hand afterwards.
   findings.push(...await rows(
-    `select u.id || ' (' || u.email || ')' as detail
+    `select u.id || ' (' || u.email || ')'
+            || case
+                 when exists (select 1 from user_jurisdictions j where j.user_id = u.id and j.revoked_at is not null)
+                   or exists (select 1 from user_capabilities c where c.user_id = u.id and c.revoked_at is not null)
+                 then ' [grants revoked]' else ' [never granted anything]'
+               end
+            || case
+                 when exists (select 1 from append_only_audit_logs a
+                                where a.entity_id = u.id and a.action_type = 'OFFICER_PASSWORD_RESET')
+                 then ' [password retired, entry recorded]'
+                 else ' [no retirement entry: cannot say whether they can still sign in]'
+               end
+            || case when u.organization_id is null then ' [unowned]' else ' [tenant ' || u.organization_id || ']' end
+       as detail
        from users u
       where not exists (select 1 from user_jurisdictions j where j.user_id = u.id and j.revoked_at is null)
         and not exists (select 1 from user_capabilities c where c.user_id = u.id and c.revoked_at is null)
       order by u.id`,
-    'officer holds no active jurisdiction and no capability — they can reach no record at all. Whether they can still sign in is not established here: the retire step replaces the password with a value that is never printed, and this query does not read credentials.'
+    'officer holds no active jurisdiction and no capability — they can reach no record at all. This is a locked account, not a deleted one: nothing here removes history, and the suffixes say what was actually recorded.'
   ));
 
   findings.push(...await rows(

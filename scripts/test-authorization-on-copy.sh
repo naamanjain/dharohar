@@ -206,6 +206,15 @@ echo ""
 echo "== row-level security on the copy =="
 chk "policies exist on both root record tables" "8" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_policies where tablename in ('parcels','land_documents')")"
 chk "both root tables are under row-level security" "2" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_class where relname in ('parcels','land_documents') and relrowsecurity")"
+# 0009: the child tables inherit the parcel's tenant. Without these the co-sharer names, the mutation
+# history and the survey evidence are protected only by the query that happens to join them.
+chk "the three child tables are under row-level security" "3" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_class where relname in ('parcel_owners','parcel_mutations','field_inspections') and relrowsecurity")"
+chk "and carry twelve inherited policies" "12" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select count(*) from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections')")"
+BARE_OWNERS="$(docker exec -i -e PGPASSWORD="$APP_PW" $SCRATCH psql -U "$APP_USER" -d "$COPY_DB" -tA -c "select count(*) from parcel_owners" 2>&1 | tail -1)"
+chk "the runtime role with no tenant context reads zero co-sharers" "0" "$BARE_OWNERS"
+# Premise for the line above: those rows exist and are reachable with a bound context, or "zero" is
+# just an empty table. Counted as the owner, which is exempt from the policies.
+chk "premise: the copy really holds co-sharer rows to hide" "1" "$(docker exec -i $SCRATCH psql -U postgres -d "$COPY_DB" -tA -c "select case when count(*)>0 then 1 else 0 end from parcel_owners")"
 BARE_ROWS="$(docker exec -i -e PGPASSWORD="$APP_PW" $SCRATCH psql -U "$APP_USER" -d "$COPY_DB" -tA -c "select count(*) from parcels" 2>&1 | tail -1)"
 # The whole point of the second layer: a query that never bound a tenant sees nothing, rather than
 # seeing everything because some application code forgot a predicate.

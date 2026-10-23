@@ -96,6 +96,24 @@ async function bootstrap() {
     organizationId = found.rows[0].id;
   }
 
+  // An officer with no tenant cannot read a single record: every record route answers
+  // TENANT_CONTEXT_MISSING, and RLS filters everything out. That is the correct fail-closed behaviour,
+  // but it is not what someone running this command to "get in" expects, so say it out loud rather
+  // than letting them discover it through a wall of 403s.
+  if (!organizationId) {
+    const registry = await pool.query(`SELECT to_regclass('public.organizations') IS NOT NULL AS present`);
+    const tenants = registry.rows[0].present
+      ? (await pool.query(`SELECT string_agg(id, ', ' ORDER BY id) AS ids, count(*)::int AS n FROM public.organizations`)).rows[0]
+      : { ids: null as string | null, n: 0 as number };
+    if (tenants.n > 0) {
+      console.warn('[BOOTSTRAP] No tenant was given, so this administrator is written with organization_id = NULL.');
+      console.warn(`[BOOTSTRAP] Tenants in this database: ${tenants.ids}`);
+      console.warn('[BOOTSTRAP] A tenant-less officer is refused by every record route (TENANT_CONTEXT_MISSING).');
+      console.warn('[BOOTSTRAP] Re-run with BOOTSTRAP_ORG_ID=<tenant>, or assign ownership afterwards with ' +
+        'server/src/db/assignOwnership.ts.');
+    }
+  }
+
   // There is no logged-in officer yet, so the trail attributes the grant to the bootstrap command
   // itself rather than inventing a person.
   const bootstrapActor: RequestPrincipal = {

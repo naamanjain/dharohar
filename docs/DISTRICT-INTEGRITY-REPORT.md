@@ -196,3 +196,101 @@ the positive ones worth reading.
    with the RLS work, where every query can be tested.
 6. **An officer with no jurisdiction and no capability can still sign in.** Nothing marks a person as
    having left; revocation removes authority, not the account.
+   *Partly overtaken — see §6.7.*
+
+---
+
+## 6. Re-measured on the deployed synthetic demo, 2026-10-24
+
+Everything above this line is the 2026-10-18 report and is left as it was written. This section is the
+current state, produced by the same checker after migrations 0004–0009:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  verify dist-server/verify_district_integrity.js        # exit 1 = findings exist; nothing is modified
+```
+
+```
+identity    : dharohar_verifier — exempt from row-level security, so this report sees the whole register
+migrations recorded: 0001, 0002, 0003, 0004, 0005, 0006, 0007, 0008, 0009
+58 finding(s).
+```
+
+### 6.1 What the schema now guarantees by itself
+
+Five of the eleven defect classes in §1 are no longer possible on a *new or edited* record, because
+PostgreSQL refuses the write rather than because the checker would catch it:
+
+| §1 check | now enforced by |
+|---|---|
+| 2, 8 — a district that is not in the registry | the 0003 write-time trigger (`DISTRICT_NOT_REGISTERED`) plus `fk_*_district_code`, which the tenancy drill proved survives a trigger being disabled |
+| 3 — two rows normalising to one jurisdiction | `ux_districts_canonical_name`, and `DISTRICT_CODE_AMBIGUOUS` in 0004/0005 |
+| 9 — `users.district` disagreeing with the code | `ck_*_district_code_matches` and the sync trigger |
+| 10 — an owner row whose parcel does not exist | the `parcel_owners.parcel_id` foreign key (measured: 0 orphan parentage across all three child tables) |
+| — a record visible to the wrong tenant | row-level security on `parcels`/`land_documents` (0006) and the three child tables (0009) |
+
+### 6.2 The 58 findings are 56 records, and here is what each one is
+
+| count | finding | what was measured about it |
+|---|---|---|
+| 54 | officer holds no active jurisdiction and no capability | All 54 are on the suite fixture domain `@dharohar.test`, created 2026-10-16…19. **Every one** now carries, in the same report line, `[grants revoked]` (a `revoked_at` row exists, so an assignment existed and was withdrawn rather than never granted) and `[password retired, entry recorded]` (an `OFFICER_PASSWORD_RESET` audit entry exists). None owns a parcel or a document; between them they authored 256 audit entries. They are **kept**: deleting them would delete the trail of what the suites did. |
+| 2 | document has neither a district nor a parcel | `doc-persist-1792063015` and `doc-persist-1792165400`, both `persist_probe.pdf`, written 2026-10-15/16 by the persistence probes to answer "does a write survive to PostgreSQL at all". Unreachable by construction, and not repaired by inventing a parcel for them. |
+| 2 | document has no owner and inherits none from a linked parcel | the same two rows, reported under the tenancy cause as well. 58 findings, 56 distinct records — the overlap is deliberate: two different questions, the same two rows. |
+
+Nothing in this list is a schema defect. Every row is either an acknowledged decision kept on purpose or
+a fixture that a human has to dispose of through a stated path — ownership assignment
+(`db:assign-ownership`) for a record, retirement (`db:retire-residue`) for an account.
+
+### 6.3 What changed about *how* it is reported
+
+1. **The checker refuses to run half-blind.** It prints the identity it ran as and exits 2 if that
+   identity is subject to row-level security, because a filtered read turns *hidden* into *missing* —
+   which is precisely how 41 orphaned-owner findings that did not exist were once "discovered". The
+   documented invocation is now the read-only `dharohar_verifier` identity via the `verify` service, not
+   the writable schema owner.
+2. **Each locked-account line now states its own evidence** (`[grants revoked]`, `[password retired, entry
+   recorded]`, `[tenant …]`/`[unowned]`) instead of leaving "can they still sign in?" as an open question
+   the reader had to investigate by hand.
+3. **Quarantine is reported as a decision, not as a defect.** 12 parcels under retired test fixtures are
+   named as deliberately unowned per the owner's decision of 2026-10-19, and the registry note says what
+   `provenance='declared'` on 12 rows does and does not certify.
+
+### 6.4 Numbers for the record, measured today
+
+parcels 42 (30 owned by `ORG-DHAROHAR-DEMO`, 12 quarantined; 31 archived / 11 active) · documents 45 (43
+owned, 2 quarantined) · officers 59 (all owned; 5 with a live grant or capability, 54 locked) ·
+`parcel_owners` 43 rows, 12 of them hanging off quarantined parcels and therefore invisible to every
+tenant by design · `parcel_mutations` 16 · `field_inspections` 0 · audit chain 2,341 entries, contiguous
+ids 1..2,341, hash-verified as INTACT by `verify dist-server/verify_audit_chain.js`.
+
+Counts move every time a gate runs against this database, because the gates create officers, parcels and
+documents and nothing in the application deletes them. That drift is expected; it is not corruption, and
+it is why these numbers are dated.
+
+### 6.5 The two claims this report still cannot make
+
+* **It cannot certify that any district name is authoritative.** 12 registry rows are
+  `provenance='declared'` and the rest `derived`; the checker only proves rows agree with each other.
+  Authoritative geography is a person's statement — which is why a new database now has to make one
+  (`npm run db:declare-geography`) before migration 0006 will proceed.
+* **It cannot say anything about real records.** Every row here is synthetic.
+
+### 6.6 §5 items, re-checked against today's state
+
+| §5 item | status |
+|---|---|
+| D1 — no authoritative district source | unchanged, and now load-bearing for installation (see 6.5) |
+| D2 — legacy rows listed, not repaired | unchanged; disposition tooling exists and is guarded |
+| D3 — `parcels.document_id` unconstrained | unchanged |
+| D4 — district free text at the API boundary | **unchanged, and checked rather than assumed**: `districtScopeClause` still compares `LOWER(TRIM(p.district))` against the officer's assignment list, not `district_code`. What 0004/0005 added is that the text can no longer *disagree* with the code on a stored row (sync trigger plus `ck_*_district_code_matches` plus the code foreign key) — the authority is still resolved from the text, so the code is a guarantee about storage, not yet the basis of authorization |
+| D5 — tenants | **changed**: tenancy is implemented in two layers (0006/0009) and tested against `dharohar_app` directly; `docs/TENANT-DATA-ACCESS.md` is the table-by-table record |
+
+### 6.7 §6.6 item 6 above — "can still sign in"
+
+Measured on the 54 residue accounts: each carries an `OFFICER_PASSWORD_RESET` audit entry written by
+`db:retire-residue`, which replaces the password with a generated value that is never printed or stored
+anywhere readable. So they cannot authenticate. What is still true is the underlying design point: the
+schema has no `disabled` or `locked` column at all — `users` has 19 columns and none of them is a
+retirement state — so "this account is retired" is only inferable from the absence of live grants plus
+the presence of the reset entry. A retire *state* on the account is still an open design decision, not an
+implemented one.

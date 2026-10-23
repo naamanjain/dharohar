@@ -371,21 +371,69 @@ export async function seedDatabase() {
       );
     }
 
+    // 0b. Resolve the tenant the demo rows belong to, BEFORE any row is written.
+    //
+    // Since migration 0006 a record with no organization is quarantined: it stays in the database but
+    // is invisible to every tenant, at both layers. Seed rows written without an owner therefore
+    // produce an environment that looks empty to the officer you bootstrap next. "The only tenant this
+    // environment has" is the same stated basis 0006 uses for the rows that already existed — it is not
+    // an inference from which district a row sits in, and the moment a second tenant exists the basis
+    // stops existing, so the seed refuses rather than distributing fixtures across tenants by guesswork.
+    const seedGrantor = 'seed:db:seed';
+    const seedReason =
+      'Synthetic demo fixture written by db:seed. Demo data only: not a statement about real land records.';
+    const registry = await client.query(`SELECT to_regclass('public.organizations') IS NOT NULL AS present`);
+    let tenantCount = 0;
+    let seedTenantId: string | null = null;
+    if (registry.rows[0].present) {
+      const tenants = await client.query(`SELECT id FROM public.organizations ORDER BY id`);
+      tenantCount = tenants.rowCount ?? 0;
+      if (tenantCount === 1) seedTenantId = tenants.rows[0].id;
+    }
+    if (tenantCount > 1) {
+      throw new Error(
+        `[SEED_TENANT_AMBIGUOUS] this database has ${tenantCount} organizations, so there is no single tenant ` +
+          'these fixtures belong to. Seeding would either invent an owner for every demo record or leave them all ' +
+          'quarantined. Assign ownership per record through the disposition command instead, and seed only a ' +
+          'single-tenant demo environment.'
+      );
+    }
+    if (!seedTenantId) {
+      console.warn(
+        '[DHAROHAR DB] No organization exists yet, so seeded records are written unowned. They will be ' +
+          'invisible to every tenant until ownership is assigned (server/src/db/assignOwnership.ts).'
+      );
+    }
+    // The three inserts below carry 12, 27 and 17 positional parameters, so the tenant columns are
+    // $13-$15, $28-$30 and $18-$20. `now()` is not parameterised because it is not caller input.
+    const ownerColumns = seedTenantId
+      ? ', organization_id, organization_granted_by, organization_grant_reason, organization_granted_at'
+      : '';
+    const ownerUsers = seedTenantId ? ', $13, $14, $15, now()' : '';
+    const ownerParcels = seedTenantId ? ', $28, $29, $30, now()' : '';
+    const ownerDocuments = seedTenantId ? ', $18, $19, $20, now()' : '';
+    const ownerParams = seedTenantId ? [seedTenantId, seedGrantor, seedReason] : [];
+
     // 1. Seed users
     for (const u of INITIAL_USERS) {
       await client.query(
         `INSERT INTO users (
           id, email, password_hash, salt, role, display_name, designation,
-          badge_number, jurisdiction, district, state, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          badge_number, jurisdiction, district, state, created_at${ownerColumns}
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12${ownerUsers})
         ON CONFLICT (id) DO UPDATE SET
           password_hash = EXCLUDED.password_hash,
           role = EXCLUDED.role,
           display_name = EXCLUDED.display_name,
-          designation = EXCLUDED.designation;`,
+          designation = EXCLUDED.designation
+          ${seedTenantId ? `, organization_id = COALESCE(users.organization_id, EXCLUDED.organization_id),
+            organization_granted_by = COALESCE(users.organization_granted_by, EXCLUDED.organization_granted_by),
+            organization_grant_reason = COALESCE(users.organization_grant_reason, EXCLUDED.organization_grant_reason),
+            organization_granted_at = COALESCE(users.organization_granted_at, EXCLUDED.organization_granted_at)` : ''};`,
         [
           u.id, u.email, u.passwordHash, u.salt, u.role, u.displayName,
-          u.designation, u.badgeNumber, u.jurisdiction, u.district, u.state, u.createdAt
+          u.designation, u.badgeNumber, u.jurisdiction, u.district, u.state, u.createdAt,
+          ...ownerParams
         ]
       );
     }
@@ -434,17 +482,18 @@ export async function seedDatabase() {
           mapped_area_ha, recorded_area_ha, colour, owner_name, land_type,
           inheritance, document_id, document_name, document_type, document_uploaded_at,
           document_display_id, status, ulpin_status, is_archived, verified_by, verified_at,
-          verification_notes, geom, created_at
+          verification_notes, geom, created_at${ownerColumns}
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-          $23, $24, $25, ST_GeomFromText($26, 4326), $27
+          $23, $24, $25, ST_GeomFromText($26, 4326), $27${ownerParcels}
         ) ON CONFLICT (id) DO NOTHING;`,
         [
           p.id, p.khasraNo, p.khataNo, p.khewatNo, p.patwarCircle, p.district, p.tehsil, p.village,
           p.mappedAreaHectares, p.recordedAreaHectares, p.colour, p.ownerName, p.landType,
           p.inheritance, p.documentId, p.documentName, p.documentType, p.documentUploadedAt,
           p.documentDisplayId, p.status, p.ulpinStatus, false, p.verifiedBy || null, p.verifiedAt || null,
-          p.verificationNotes || null, wkt, p.createdAt
+          p.verificationNotes || null, wkt, p.createdAt,
+          ...ownerParams
         ]
       );
 
@@ -470,19 +519,23 @@ export async function seedDatabase() {
         `INSERT INTO land_documents (
           id, parcel_id, document_code, file_name, record_type, ocr_language,
           raw_ocr_text, district, tehsil, village, patwar_circle, status,
-          priority, document_hash, ocr_confidence, uploaded_by, uploaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+          priority, document_hash, ocr_confidence, uploaded_by, uploaded_at${ownerColumns}
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17${ownerDocuments})
         ON CONFLICT (id) DO NOTHING;`,
         [
           d.id, d.parcelId, d.documentCode, d.fileName, d.recordType, d.ocrLanguage,
           d.rawOcrText, d.district, d.tehsil, d.village, d.patwarCircle, d.status,
-          d.priority, d.documentHash, d.ocrConfidence, d.uploadedBy, d.uploadedAt
+          d.priority, d.documentHash, d.ocrConfidence, d.uploadedBy, d.uploadedAt,
+          ...ownerParams
         ]
       );
     }
 
     await client.query('COMMIT');
     console.log('[DHAROHAR DB] Seed data populated into PostgreSQL with PostGIS geometries.');
+    console.log(
+      `[DHAROHAR DB] Demo records owned by: ${seedTenantId ?? 'NO TENANT — written unowned, invisible to every tenant'}`
+    );
     // Printed once, by the command that just set it, to the person who ran it. The alternative —
     // shipping the demo password in the repository — gave anyone who could read the code a working
     // credential for four officer accounts.

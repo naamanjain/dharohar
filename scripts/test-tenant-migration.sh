@@ -491,6 +491,81 @@ chk "the audit table itself was not emptied by the rollback" "$AUDIT_BEFORE" "$(
 out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0008.sql 2>&1); rc=$?
 chk "0008 re-applies after rollback" "0" "$rc"
 
+# ---- 5f. migration 0009: a child record inherits its parcel's tenant -----------
+say "== apply 0009 (child tables inherit the parent policy) =="
+docker cp server/src/db-draft/0009_child_records_inherit_tenant_scope.sql $SCRATCH:/tmp/0009.sql >/dev/null
+docker cp server/src/db-draft/rollback-0009.sql $SCRATCH:/tmp/rollback-0009.sql >/dev/null
+CHILD_BEFORE="$(q "select (select count(*) from parcel_owners)||'/'||(select count(*) from parcel_mutations)")"
+ORPHANS="$(q "select (select count(*) from parcel_owners o where not exists (select 1 from parcels p where p.id=o.parcel_id))
+                 + (select count(*) from parcel_mutations m where not exists (select 1 from parcels p where p.id=m.parcel_id))
+                 + (select count(*) from field_inspections i where not exists (select 1 from parcels p where p.id=i.parcel_id))")"
+say "  child rows before (owners/mutations): $CHILD_BEFORE"
+chk "premise: the copy holds child rows for the policy to cover" "1" "$([ "${CHILD_BEFORE%%/*}" -gt 0 ] && echo 1 || echo 0)"
+# Rows with no parent would silently vanish from every tenant's view the moment the parent-exists
+# predicate goes in. Measured rather than assumed, on this copy, before the change.
+chk "no child row is orphaned (nothing becomes unreachable by accident)" "0" "$ORPHANS"
+
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/0009.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'NOTICE|ERROR' | sed 's/^/    /' | tail -8)"
+chk "0009 apply exits 0" "0" "$rc"
+chk "the three child tables are under row-level security" "3" \
+    "$(q "select count(*) from pg_class where relname in ('parcel_owners','parcel_mutations','field_inspections') and relrowsecurity")"
+chk "twelve policies were created" "12" \
+    "$(q "select count(*) from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections')")"
+# Every policy names the parent test rather than a tenant comparison of its own — that is the whole
+# design: one definition of tenancy, inherited. Asserted from the stored expression, not from prose.
+chk "every child policy filters through parcels" "12" \
+    "$(q "select count(*) from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections') and (qual like '%parcels p%' or with_check like '%parcels p%')")"
+chk "all of them apply to the runtime role only" "12" \
+    "$(q "select count(*) from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections') and roles = ARRAY['dharohar_app']::name[]")"
+chk "no command carries two policies (permissive OR would widen it)" "0" \
+    "$(q "select count(*) from (select tablename, cmd from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections') group by 1,2 having count(*)>1) d")"
+chk "0009 deleted no child row" "$CHILD_BEFORE" \
+    "$(q "select (select count(*) from parcel_owners)||'/'||(select count(*) from parcel_mutations)")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0009.sql 2>&1); rc=$?
+chk "0009 re-apply exits 0 (idempotent)" "0" "$rc"
+
+say "== 0009's guard, broken on purpose =="
+# Remove the parent policy and re-apply: 0009 must refuse rather than install a child policy that
+# inherits from nothing — which would look like protection and filter on an unenforced rule.
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q -c "drop policy tenant_select_land_documents on land_documents" >/dev/null 2>&1
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/0009.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'TENANCY_PARENT_POLICY_MISSING' | head -1 | sed 's/^/    /')"
+chk "0006 removed means 0009 refuses" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+chk "and names the table it could not inherit from" "1" "$(echo "$out" | grep -c 'land_documents')"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/rollback-0009.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ERROR' | head -2 | sed 's/^/    /')"
+chk "the aborted apply left nothing to roll back, so rollback is still clean" "0" "$rc"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0006.sql 2>&1); rc=$?
+chk "0006 re-applied to restore the parent policy" "0" "$rc"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0009.sql 2>&1); rc=$?
+chk "0009 then applies again" "0" "$rc"
+
+say "== rollback of 0009 =="
+# A policy 0009 did not create must stop the rollback: dropping "the 0009 policies" while someone
+# else's rule guards the same rows would quietly leave that rule in charge.
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q -c "create policy hand_written on parcel_owners for select to dharohar_app using (true)" >/dev/null 2>&1
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -f /tmp/rollback-0009.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ROLLBACK_REFUSED' | head -1 | sed 's/^/    /')"
+chk "rollback refused while a foreign policy exists" "3" "$([ $rc -ne 0 ] && echo 3 || echo 0)"
+chk "and it named the policy" "1" "$(echo "$out" | grep -c 'hand_written')"
+chk "nothing was dropped by the refused rollback" "5" \
+    "$(q "select count(*) from pg_policies where tablename='parcel_owners'")"
+docker exec -i $SCRATCH psql -U postgres -d "$DB_OK" -q -c "drop policy hand_written on parcel_owners" >/dev/null 2>&1
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/rollback-0009.sql 2>&1); rc=$?
+say "$(echo "$out" | grep -E 'ERROR' | head -2 | sed 's/^/    /')"
+chk "rollback-0009 exits 0 once the foreign policy is gone" "0" "$rc"
+chk "no policies remain on the child tables" "0" \
+    "$(q "select count(*) from pg_policies where tablename in ('parcel_owners','parcel_mutations','field_inspections')")"
+chk "row-level security is off again on all three" "0" \
+    "$(q "select count(*) from pg_class where relname in ('parcel_owners','parcel_mutations','field_inspections') and relrowsecurity")"
+chk "the rollback deleted no rows" "$CHILD_BEFORE" \
+    "$(q "select (select count(*) from parcel_owners)||'/'||(select count(*) from parcel_mutations)")"
+out=$(docker exec $SCRATCH psql -U postgres -d "$DB_OK" -q -v ON_ERROR_STOP=1 -f /tmp/0009.sql 2>&1); rc=$?
+chk "0009 re-applies after rollback" "0" "$rc"
+chk "and the parent policies survived the whole cycle" "8" \
+    "$(q "select count(*) from pg_policies where tablename in ('parcels','land_documents')")"
+
 # ---- 6. the guards, on a copy where nothing has been applied yet ---------------
 say "== abort cases (fresh copy, guards must fire) =="
 maint "create database $DB_ABORT;" >/dev/null

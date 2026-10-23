@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { PoolClient } from 'pg';
 import { pool, getDbHealth, memoryStore } from '../db/db';
 import { beginTenantTransaction, tenantQuery } from '../db/tenant';
-import { authenticateToken, requireRole } from '../middleware/auth';
+import { authenticateToken, denyReadOnly, requireRole } from '../middleware/auth';
 import { validateParcel, calculateGeodesicAreaHectares } from '../services/validationService';
 import { recordAuditLog, getAuditLogs } from '../services/auditService';
 import {
@@ -25,7 +25,6 @@ import {
   authorizationErrorResponse,
   districtRefusal,
   intersectReadScope,
-  isReadOnlyRole,
   logStateWideRead,
   mayRehomeParcels,
   parcelScopeClause,
@@ -37,20 +36,6 @@ import { sha256 } from '../utils/crypto';
 export const parcelsRouter = Router();
 
 const normaliseDistrict = (value: unknown): string => String(value ?? '').trim().toLowerCase();
-
-/**
- * Read-only roles may look but never change. Kept as a separate gate from jurisdiction so an
- * auditor's oversight reads are not confused with mutation rights.
- */
-const denyReadOnly = (req: Request, res: Response, next: NextFunction) => {
-  if (req.principal && isReadOnlyRole(req.principal)) {
-    return res.status(403).json({
-      success: false,
-      error: { code: 'READ_ONLY_ROLE', message: 'Auditors have read-only access to the registry.' },
-    });
-  }
-  next();
-};
 
 /** Same body for "does not exist" and "exists in another district" — 403 would confirm the id. */
 function notFound(res: Response, id: string) {
@@ -433,7 +418,7 @@ parcelsRouter.get('/:id', authenticateToken, requireParcelRead, async (req: Requ
   }
 
   try {
-    inspections = await fetchFieldInspections(id);
+    inspections = await fetchFieldInspections(id, req.principal!);
   } catch (err: any) {
     console.error('[PARCELS] inspection read failed:', err.message);
     inspections = [];
@@ -970,7 +955,7 @@ parcelsRouter.get('/:id/field-inspections', authenticateToken, requireParcelRead
   const { id } = req.params;
 
   try {
-    const inspections = await fetchFieldInspections(id);
+    const inspections = await fetchFieldInspections(id, req.principal!);
     return res.json({ success: true, data: { inspections } });
   } catch (err: any) {
     console.error('[INSPECTION] Error reading inspections:', err.message);

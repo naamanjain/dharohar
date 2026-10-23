@@ -93,7 +93,11 @@ DECLARE
     -- because a tenant's district authority has to take effect — and be revoked — immediately rather
     -- than at token expiry. Without SELECT here the authorization layer cannot decide anything and
     -- every request fails closed with AUTHORIZATION_UNAVAILABLE, which is what this grant was missing.
-    -- organization_units is read by the registry listing. Neither is deletable by this role: see 3b.
+    -- organization_units is MEASURED to have no reader or writer anywhere in server/src or client/src,
+    -- and zero rows in the deployed database: 0004 reserved the structure for internal units and nothing
+    -- uses it yet. It is granted anyway so that a later feature does not fail closed on a missing
+    -- privilege; because it carries organization_id and is NOT under row-level security, whoever gives
+    -- it a query must add the tenant policy in the same change. Neither table is deletable: see 3b.
     'organization_districts', 'organization_units'
   ];
 BEGIN
@@ -184,6 +188,81 @@ BEGIN
   END LOOP;
 END
 $do$;
+
+-- ---- 7b. The verification identity: read-only, sees through RLS --------------
+-- Validating the audit chain means reading EVERY entry, in EVERY tenant, in order. Two identities can
+-- do that: a role subject to row-level security (which sees zero rows and would report records it
+-- cannot see as missing — this project measured exactly that, and invented 41 findings), or the schema
+-- owner, which can also rewrite the chain, drop a table and truncate the register. Handing a routine
+-- diagnostic the writable owner credential is the wrong trade: the diagnostic runs often, and it
+-- should not be able to write anything.
+--
+-- So: SELECT-only, plus BYPASSRLS, plus no superuser. It is created only when a password is supplied
+-- for it, because a deployment that does not want a second credential must not end up with one it did
+-- not ask for:
+--
+--   psql -v app_password=... -v verifier_password=... -f scripts/roles.sql
+\if :{?verifier_password}
+SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dharohar_verifier') AS verifier_already_exists \gset
+
+\if :verifier_already_exists
+  ALTER ROLE dharohar_verifier WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT BYPASSRLS NOREPLICATION CONNECTION LIMIT 5 PASSWORD :'verifier_password';
+  \echo '[DHAROHAR ROLES] role dharohar_verifier already existed - attributes re-asserted, password rotated'
+\else
+  CREATE ROLE dharohar_verifier LOGIN
+    PASSWORD :'verifier_password'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS NOREPLICATION
+    CONNECTION LIMIT 5;
+  \echo '[DHAROHAR ROLES] created role dharohar_verifier (read-only, exempt from row-level security)'
+\endif
+
+DO $do$
+DECLARE
+  t text;
+  n integer := 0;
+BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO dharohar_verifier', current_database());
+  EXECUTE format('REVOKE CREATE ON SCHEMA public FROM dharohar_verifier');
+  EXECUTE format('GRANT USAGE ON SCHEMA public TO dharohar_verifier');
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename LOOP
+    EXECUTE format('GRANT SELECT ON TABLE %I TO dharohar_verifier', t);
+    EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE %I FROM dharohar_verifier', t);
+    n := n + 1;
+  END LOOP;
+  -- Future tables: read-only by default, so a migration cannot accidentally hand this identity a way
+  -- to write. (The owner that runs migrations is the role these defaults are recorded for.)
+  EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT ON TABLES TO dharohar_verifier', CURRENT_USER);
+  RAISE NOTICE '[DHAROHAR ROLES] dharohar_verifier: SELECT granted on % table(s), every write privilege revoked', n;
+END
+$do$;
+
+-- Refuse to report success if the identity is not what it claims to be. A read-only role that
+-- somehow holds a write privilege would make "the verifier cannot damage the register" false.
+DO $do$
+DECLARE
+  writable text;
+BEGIN
+  SELECT string_agg(c.relname, ', ') INTO writable
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relkind = 'r'
+     AND (has_table_privilege('dharohar_verifier', c.oid, 'INSERT')
+       OR has_table_privilege('dharohar_verifier', c.oid, 'UPDATE')
+       OR has_table_privilege('dharohar_verifier', c.oid, 'DELETE')
+       OR has_table_privilege('dharohar_verifier', c.oid, 'TRUNCATE'));
+  IF writable IS NOT NULL THEN
+    RAISE EXCEPTION '[ROLES_LOCKDOWN_FAILED] dharohar_verifier can write to: %. It is documented as read-only.', writable;
+  END IF;
+  IF (SELECT rolsuper FROM pg_roles WHERE rolname = 'dharohar_verifier') THEN
+    RAISE EXCEPTION '[ROLES_LOCKDOWN_FAILED] dharohar_verifier is a superuser, which makes every other grant meaningless.';
+  END IF;
+  RAISE NOTICE '[DHAROHAR ROLES] dharohar_verifier verified read-only: no table grants INSERT/UPDATE/DELETE/TRUNCATE';
+END
+$do$;
+\else
+  \echo '[DHAROHAR ROLES] no verifier_password supplied - dharohar_verifier not created or updated'
+  \echo '[DHAROHAR ROLES] integrity checks therefore still run as the schema owner via `maint`; supply DHAROHAR_VERIFIER_PASSWORD to use the read-only identity instead'
+\endif
 
 -- ---- 8. Tables created by FUTURE migrations ---------------------------------
 -- Without this, a new table would silently be invisible to the API until someone

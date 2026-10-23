@@ -94,7 +94,11 @@ services:
   roleinit:
     image: postgis/postgis:16-3.4-alpine
     restart: "no"
-    entrypoint: ["sh", "-c", 'exec psql --no-psqlrc -q -v ON_ERROR_STOP=1 -v app_password="$DHAROHAR_APP_PASSWORD" -f /roles.sql']
+    # DHAROHAR_VERIFIER_PASSWORD is optional: when it is absent, roles.sql leaves the read-only
+    # verification identity alone. $$V is escaped because compose interpolates a bare $V at parse time
+    # and would erase it before the shell ever saw the conditional. $V is deliberately unquoted so psql
+    # receives -v and its argument as two words — which is why the password has to be hex.
+    entrypoint: ["sh", "-c", 'V=""; if [ -n "${DHAROHAR_VERIFIER_PASSWORD:-}" ]; then V="-v verifier_password=$DHAROHAR_VERIFIER_PASSWORD"; fi; exec psql --no-psqlrc -q -v ON_ERROR_STOP=1 -v app_password="$DHAROHAR_APP_PASSWORD" $$V -f /roles.sql']
     environment:
       PGHOST: db
       PGPORT: 5432
@@ -102,6 +106,7 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?see POSTGRES_PASSWORD note above}
       PGDATABASE: ${POSTGRES_DB:-dharohar}
       DHAROHAR_APP_PASSWORD: ${DHAROHAR_APP_PASSWORD:?see DHAROHAR_APP_PASSWORD note above}
+      DHAROHAR_VERIFIER_PASSWORD: ${DHAROHAR_VERIFIER_PASSWORD:-}
     volumes:
       - ./scripts/roles.sql:/roles.sql:ro
     depends_on:
@@ -128,6 +133,31 @@ services:
       DATABASE_URL: *owner-url
       DEMO_PASSWORD: ${DEMO_PASSWORD:?DEMO_PASSWORD is not set - the seed needs it to set the demo persona password}
       SEED_CONFIRM: ${SEED_CONFIRM:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+
+  # The integrity checker and the audit-chain validator, run as the READ-ONLY verification identity
+  # instead of the schema owner. It has to be exempt from row-level security — a tenant-scoped identity
+  # reports records it cannot see as missing, which is how 41 findings that did not exist were once
+  # "discovered" — but it must not be able to write. Same image as maint, different credential.
+  #   docker compose -f docker-compose.prod.yml --profile tools run --rm verify dist-server/verify_district_integrity.js
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["node"]
+    environment:
+      NODE_ENV: production
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: dharohar_verifier
+      PGPASSWORD: ${DHAROHAR_VERIFIER_PASSWORD:-}
+      PGDATABASE: ${POSTGRES_DB:-dharohar}
+      DATABASE_URL: postgresql://dharohar_verifier:${DHAROHAR_VERIFIER_PASSWORD:?DHAROHAR_VERIFIER_PASSWORD is not set - scripts/roles.sql creates this read-only role; generate one with 'openssl rand -hex 32'}@db:5432/${POSTGRES_DB:-dharohar}
     depends_on:
       db:
         condition: service_healthy

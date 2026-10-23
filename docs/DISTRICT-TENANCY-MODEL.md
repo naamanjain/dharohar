@@ -472,3 +472,96 @@ Things this phase found by running, not by reading:
 6. Two of my own assertions were wrong while the code was right: a JavaScript `===` between a `bigint`
    string and a number, and a rollback expectation that compared against the assigned count instead of
    the whole table.
+
+## 14. What was executed on 2026-10-23 (release-blocker verification: 0009, a fresh install, and a read-only verifier)
+
+Ledger is now `0001…0009`. Nothing was pushed; `c351624` and `df48712` remain local, plus this phase's
+work. The environment is still synthetic-only and still private: no public port, no real record.
+
+| Check | Measured |
+| --- | --- |
+| `./scripts/test-tenant-migration.sh` | **141 assertions passed, 0 failed** (was 117). The new §5f block applies 0009, asserts all twelve policies by predicate text, role, permissive type and USING/WITH CHECK presence, fires its guard by dropping 0006's parent policy, refuses the rollback while a policy it did not create exists, then rolls back and re-applies |
+| `./scripts/test-fresh-install.sh` (new) | **105 assertions passed, 0 failed, exit 0** — empty database → full schema; the same schema as an upgraded database compared object-for-object; documented provisioning checked against the rows it writes; and a migration aborted on purpose, diagnosed and recovered |
+| `./scripts/test-authorization-on-copy.sh` | jurisdiction **46/0**, provisioning **91/0**, tenancy **68/0** (was 42). The additions are the child tables read and written directly as `dharohar_app`, a role changed in the database while its token stayed valid, and a pooled connection tested for tenant carry-over |
+| `./scripts/test-rls-blind-certifier.sh` (new) | all checks passed — the certifier exits 2 with `NOT CERTIFIED` when its identity sees 0 of 2,164 entries, and exits 0 with `INTACT` for an exempt identity over the same rows |
+| `./scripts/validate-stack.sh` | **67 passed, 1 failed** — still `ADMIN_PASSWORD not exported`; see "still open" |
+| `npm test`, `npm run lint` | exit 0 — phase 4 **47/0**, E2E **53/0**, tsc clean |
+| `./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups` | all checks passed: payload digest identical after dump → second volume → restore; chain digest identical on both sides (2,341 entries); geometries valid; ownership and RLS present in the restored copy. It prints its own limit: the destination is a different **volume**, not a different **machine** |
+| Chain and integrity as `dharohar_verifier` | `verify_audit_chain.js` exit 0: 2,341 entries, ids contiguous 1..2,341, INTACT. `verify_district_integrity.js`: 58 findings, same substance as before |
+
+### What this phase found by running rather than reading
+
+1. **A fresh install could not reach the current schema at all.** `npm run db:migrate` on an empty
+   database stopped at 0006 with `[TENANCY_NO_CANONICAL_GEOGRAPHY]`. Structural, not incidental: 0004
+   does not create districts, it classifies the rows already present, so a new database has no canonical
+   geography and 0006 rightly refuses to invent an ownership basis. The demo deployment could never show
+   this because it was upgraded in place from 0001. Fixed by adding the missing step instead of
+   weakening the guard — `npm run db:declare-geography`, an owner-side command in which a named person
+   states which districts are authoritative and which tenant holds which relationship, with a reason.
+   The install is now two passes with an attributable human decision between them.
+2. **Seeding a fresh database produced an environment that read back empty.** `db:seed` wrote parcels,
+   documents and officers with no `organization_id`, which since 0006 means *quarantined*: invisible to
+   every tenant at both layers. A new deployment looked installed and was unusable. The seed now stamps
+   its own rows with attribution (`seed:db:seed` plus a stated reason) and refuses with
+   `[SEED_TENANT_AMBIGUOUS]` when more than one organization exists, because that is the case where
+   "which tenant owns this fixture" has no answer.
+3. **An administrator bootstrapped without a tenant could not open one record.** Correct behaviour,
+   previously silent. The command now lists the tenants in the database and names the flag that would
+   have attached the account to one.
+4. **`fetchFieldInspections` read survey evidence with no tenant bound.** Every other child-table path
+   was already inside a tenant transaction; this one went straight to the pool — and it is the table
+   holding the observer, the photo URI and the evidence digest. It takes the principal now.
+5. **The child tables were the unprotected payload.** 0009 puts `parcel_owners`, `parcel_mutations` and
+   `field_inspections` under row-level security by *inheriting* the parent parcel's policy rather than
+   restating tenancy, so there is still exactly one definition of a tenant in the database. Measured
+   before applying: no child row in any of the three tables has a missing or NULL parent, so nothing
+   became unreachable except rows whose parcel is itself already quarantined (12 of 43 co-sharer rows).
+6. **`pool.end()` while a client is still checked out is a deadlock, not a shutdown.** Two owner-side
+   commands called it from their error path, so a failed run hung forever instead of exiting with a
+   message. It appeared as a fresh-install drill producing no output for eight minutes; the database
+   showed an idle connection and the process was simply never returning. Both call sites now release the
+   client before ending the pool.
+7. **Chain verification needed its own identity.** The requirement was a *privileged read-only* identity
+   that does not produce misleading findings under RLS. The schema owner is privileged but can rewrite
+   history; the runtime role is least-privilege but blind. `dharohar_verifier` is a third thing:
+   `BYPASSRLS`, no superuser, SELECT on all fifteen tables, every write privilege explicitly revoked,
+   and `roles.sql` refuses to finish if that is not literally true (`[ROLES_LOCKDOWN_FAILED]`). The
+   certifier now compares what it can see against what PostgreSQL says was ever inserted, and refuses
+   rather than reporting health — proved by a script that installs a policy to hide the ledger.
+8. **`requireRole` was reading the token.** It checked `req.user.role`, the claim signed at login, while
+   `req.principal.role` — read from the database on that same request — was sitting unused. A demoted
+   officer kept exercising the old role until the token expired. It reads the principal now, and the
+   suite proves it from the direction that cannot be faked: demote in the database, keep using the same
+   token, and the 403 names a role the token never claimed (`READ_ONLY_ROLE`).
+9. **Two documentation defects surfaced while writing the report.** `SECURITY.md` numbered two different
+   open items `7b`; and `roles.sql` justified its `organization_units` grant by claiming the registry
+   listing reads that table, which nothing in `server/src` or `client/src` does. Both are corrected, and
+   the second now states the measured fact plus the obligation on whoever changes it.
+10. **Assertions I had to fix because they were wrong while the code was right:** a `bigint` compared with
+    `===` to a number; a `grep -c` that legitimately returned 2 where the assertion demanded 1; a
+    policy-set comparison that looked at only the two root tables while a third migration doubled the
+    count; a "baseline predates the tenant tables" check that looked for `organizations` *or*
+    `organization_districts` — `organizations` predates 0004, so it failed on a correct baseline; and
+    control rows planted into `districts` with a code that `ck_districts_code_is_name` rejects, which
+    meant three guard assertions were being tested against a registry that had nothing to guard.
+
+### Still open at the end of this phase
+
+* **The live-stack provisioning gate cannot be run by me.** `sysadmin@dharohar.local` holds `USER_ADMIN`,
+  its password is not `DEMO_PASSWORD` (measured: HTTP 401), and `db:bootstrap-admin` refuses to mint a
+  second administrator by design. Supplying `ADMIN_PASSWORD` is an owner action. The suite itself runs
+  green against a restored copy where the harness bootstraps its own administrator (91/0), so the code
+  path is verified — it is the *live stack* invocation that is not.
+* **The 58 findings remain findings.** 56 distinct records: 54 suite-residue officers on the
+  `@dharohar.test` fixture domain — each with a revoked grant row *and* an `OFFICER_PASSWORD_RESET` audit
+  entry, none owning any record, 256 audit entries between them — plus 2 persistence-probe documents with
+  neither a district nor a parcel. Kept, not deleted; the checker now prints that evidence per row
+  instead of leaving the account's login state as an open question.
+* **No real record images in the register.** 2 of 45 documents carry any payload, both written by drills.
+* **The archive leaves the database container but not the machine.** A second volume is not a second
+  server, and there is no encryption at rest for the dump, so "production-grade disaster recovery" is
+  still not a claim to be made.
+* **Two tenant-less tables by design.** `users` and the assignment tables are readable by the runtime
+  credential without a tenant bound, because login must resolve them first. The residual exposure is
+  named in `docs/TENANT-DATA-ACCESS.md` rather than argued away; narrowing it means a second identity for
+  authentication reads, which is a role-design change and a decision for the owner.

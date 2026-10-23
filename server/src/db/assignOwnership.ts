@@ -161,14 +161,16 @@ async function main() {
       client
     );
     await client.query('COMMIT');
+    // Released on both paths, and before pool.end() on the failure path: pool.end() waits for every
+    // checked-out client, so ending the pool while this one is still held hangs instead of exiting.
+    client.release();
     console.log(`[OWNERSHIP] ${targets.length} ${table} row(s) assigned to ${organization}, attributed to ${grantor}, and written to the audit chain.`);
   } catch (err: any) {
     await client.query('ROLLBACK').catch(() => {});
+    client.release();
     console.error('[OWNERSHIP] FAILED and rolled back — the database is unchanged:', err.message);
     await pool.end();
     process.exit(1);
-  } finally {
-    client.release();
   }
 
   const still = await pool.query(

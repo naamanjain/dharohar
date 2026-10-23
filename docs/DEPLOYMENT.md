@@ -312,6 +312,7 @@ docker compose -f docker-compose.prod.yml --profile tools run --rm migrate
 | `0006` | record **ownership** distinct from district **jurisdiction**: `land_documents.organization_id`, attribution columns with CHECK constraints, ownership assigned only on a stated basis, row-level security on `parcels` and `land_documents` | same drill, §5c; `scripts/test-authorization-on-copy.sh` proves the policies against `dharohar_app` |
 | `0007` | a declaration is `candidate`, not canonical geography; promotion needs `USER_ADMIN` + a reason | same drill, §5d; `validate-stack.sh` asserts the default and that retired fixtures stay retired |
 | `0008` | audit entries record `actor_user_id` / `actor_organization_id`, outside the entry hash | same drill, §5e — including that the chain digest is unchanged by a re-apply |
+| `0009` | `parcel_owners`, `parcel_mutations` and `field_inspections` come under row-level security by inheriting their **parent parcel's** policy — a co-sharer list, a mutation history and a field survey no longer depend on the query that joins them | same drill, §5f: apply, 12 policies asserted by predicate and role, the guard fired on purpose by dropping 0006's policy, rollback refused while a foreign policy exists, re-apply after rollback |
 
 Each of `0006`, `0007` and `0008` aborts if the migration it is stated against has not been applied, so
 they cannot be applied out of order, and each has a `rollback-NNNN.sql` that refuses rather than
@@ -324,8 +325,10 @@ Two scripts exist so a schema change is executed against a throwaway database, n
 copy of the working data:
 
 ```bash
-./scripts/test-tenant-migration.sh        # 65 assertions: apply, idempotence, rollback, guards
+./scripts/test-tenant-migration.sh        # 141 assertions: apply, idempotence, rollback, guards
 ./scripts/test-authorization-on-copy.sh   # restore a copy, least-privilege API, three suites
+./scripts/test-fresh-install.sh           # empty database -> full schema, twice, and compared
+./scripts/test-rls-blind-certifier.sh     # the chain certifier must REFUSE a partial read
 ```
 
 The first takes a migration from `server/src/db-draft/NNNN_*.sql`, applies it, re-applies it, rolls it
@@ -340,6 +343,80 @@ Generate database passwords as **hex**, not base64: `openssl rand -hex 32`. Comp
 `DHAROHAR_APP_PASSWORD` into `DATABASE_URL` raw, and base64 can contain `/` or `+`, which makes the
 URL unparseable — the API then refuses to start in production with `Invalid URL`, which is correct
 behaviour but names neither the setting nor the cause.
+
+### Installing into an empty database — two passes, and why that is correct
+
+`npm run db:migrate` on a brand-new database stops at 0006 with
+
+```
+[TENANCY_NO_CANONICAL_GEOGRAPHY] the registry has no canonical districts,
+so there is no defined basis for an assignment. Nothing was changed.
+```
+
+That is the migration behaving as designed, not a failure to work around. In the demo deployment the
+four canonical districts were already present as data when 0004 ran, so 0004 classified what was there
+and 0006 had a basis to assign ownership from. A new database has no districts at all, so there is
+nothing to assign from — and inventing geography because a deploy script needs it to finish is exactly
+the invention this schema refuses everywhere else. The install is therefore two passes with an
+attributable human decision between them:
+
+```bash
+npm run db:migrate            # 0001–0005, then stops and says why: no canonical geography yet
+npm run db:declare-geography  # a person states the districts and which tenant holds which one
+npm run db:migrate            # 0006–0009 now have their basis and apply
+npm run db:seed               # optional: the synthetic demo dataset, into a single-tenant database
+npm run db:bootstrap-admin    # the first officer, given BOOTSTRAP_ORG_ID
+```
+
+Re-running any of these is safe: the declaration is idempotent (canonical rows that already exist are
+reported and left alone, and `organization_districts` has a unique constraint so a grant is never
+duplicated), and the runner records each version once.
+
+`db:declare-geography` refuses rather than guessing, and `scripts/test-fresh-install.sh` asserts each
+refusal: a reason shorter than ten characters, an organization id that does not exist, a district name
+colliding with an existing row under a different code, re-classifying a district that is already
+`test_fixture` or `retired` without `GEOGRAPHY_OVERWRITE=true`, and the same name listed twice. What it
+writes is a canonical `districts` row per name plus one `organization_districts` grant per district, each
+carrying `granted_by` and `reason`, and an audit entry when 0008 has supplied the actor columns. On a new
+database it necessarily runs *before* 0008, so it announces that no audit entry was written and points at
+the grant rows, which are the durable record of the decision either way.
+
+`db:seed` follows the same rule. It stamps its demo rows with the tenant that exists — and if more than
+one organization exists it aborts with `[SEED_TENANT_AMBIGUOUS]` rather than distributing fixtures
+across tenants by guesswork, because a record with no owner is quarantined and invisible, and a seeded
+environment nobody can read is a broken install, not a safe one.
+
+The drill that proves all of this runs `./scripts/test-fresh-install.sh`: an empty database migrated to
+the same schema as an upgraded one (object counts, RLS policies, ownership, and the runtime role's
+privileges compared after `roles.sql` has been applied to both), the documented provisioning sequence
+checked against the rows it writes rather than its exit codes, and a migration deliberately aborted by
+planting a second tenant — then diagnosed, resolved by removing the ambiguity rather than by editing the
+migration, and completed.
+
+### The three database identities
+
+| identity | what it can do | who uses it |
+| --- | --- | --- |
+| `dharohar` | schema owner, superuser in the container | `migrate`, `roleinit`, `seed`, `maint` one-shots only — never the API |
+| `dharohar_app` | SELECT/INSERT/UPDATE on operational tables, DELETE on `parcel_owners` only, INSERT+SELECT on the audit ledger, SELECT on the ledger table; no DDL, no TRUNCATE, `NOBYPASSRLS`, `NOINHERIT`, `NOCREATEROLE` | the long-running API |
+| `dharohar_verifier` | **SELECT on everything, `BYPASSRLS`, no superuser, no write privilege of any kind** | `verify` one-shot: district integrity and audit-chain certification |
+
+The third exists because validating the audit chain requires reading every entry in every tenant. Doing
+that as the schema owner hands a routine diagnostic the one credential that can rewrite history; doing
+it as `dharohar_app` produces a *false* report, because row-level security hides rows and the validator
+then certifies the chain it was allowed to see. `scripts/test-rls-blind-certifier.sh` demonstrates the
+second failure on a disposable copy and shows the certifier refusing with exit 2 instead.
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  verify dist-server/verify_audit_chain.js
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  verify dist-server/verify_district_integrity.js
+```
+
+`roles.sql` creates and updates it only when `DHAROHAR_VERIFIER_PASSWORD` is present in the environment,
+and refuses to finish if the role it created can write anywhere — `[ROLES_LOCKDOWN_FAILED]`. Without
+that variable the script says so and the diagnostics continue to run as the owner through `maint`.
 
 ### Do not seed a real database
 

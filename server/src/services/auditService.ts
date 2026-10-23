@@ -314,6 +314,63 @@ export async function getAuditLogs(filter?: {
 }
 
 /**
+ * What the chain validator can actually see, measured rather than assumed.
+ *
+ * The first version of this project produced 41 findings that did not exist because a diagnostic ran as
+ * an identity subject to row-level security and read the rows it could not see as rows that were
+ * missing. The same trap lives here in the opposite direction: a chain read that returns NO entries
+ * "verifies" trivially — an empty list has no broken links — so a validator with a filtered view would
+ * report a healthy chain while seeing none of it. Health therefore requires evidence of visibility,
+ * not the absence of failures.
+ */
+export interface AuditChainVisibility {
+  verifiedAs: string;
+  identityExempt: boolean;
+  rlsEnabled: boolean;
+  entriesSeen: number;
+  maxIdSeen: number;
+  rowsInsertedEver: number;
+  seesWholeLedger: boolean;
+  reason: string;
+}
+
+export async function auditChainVisibility(): Promise<AuditChainVisibility> {
+  const probe = await pool.query(
+    `select current_user as who,
+            (select rolsuper from pg_roles where rolname = current_user) as super,
+            (select rolbypassrls from pg_roles where rolname = current_user) as bypass,
+            (select coalesce(relrowsecurity,false) from pg_class where oid = 'append_only_audit_logs'::regclass) as rls,
+            (select count(*)::bigint from append_only_audit_logs) as seen,
+            (select coalesce(max(id),0)::bigint from append_only_audit_logs) as max_id,
+            (select coalesce(n_tup_ins,0)::bigint from pg_stat_user_tables where relname = 'append_only_audit_logs') as inserted`
+  );
+  const r = probe.rows[0] ?? {};
+  const exempt = r.super === true || r.bypass === true;
+  const seen = Number(r.seen ?? 0);
+  const inserted = Number(r.inserted ?? 0);
+  // n_tup_ins is a cumulative counter from the statistics collector: it is not filtered by row-level
+  // security, so "how many rows were ever written" is an independent yardstick for "how many can I see".
+  const complete = seen >= inserted;
+  const seesWholeLedger = complete && (!r.rls || exempt);
+  let reason = 'this identity can see every entry the ledger has ever had';
+  if (!complete) {
+    reason = `${inserted - seen} of ${inserted} inserted entries are not visible to "${r.who}" — the chain would be judged from a partial read`;
+  } else if (r.rls && !exempt) {
+    reason = `"${r.who}" is subject to row-level security on the audit table; a filtered chain read cannot prove anything about the entries it did not receive`;
+  }
+  return {
+    verifiedAs: String(r.who ?? 'unknown'),
+    identityExempt: exempt,
+    rlsEnabled: r.rls === true,
+    entriesSeen: seen,
+    maxIdSeen: Number(r.max_id ?? 0),
+    rowsInsertedEver: inserted,
+    seesWholeLedger,
+    reason,
+  };
+}
+
+/**
  * Verify cryptographic integrity of the audit chain
  */
 export async function verifyAuditChain(): Promise<{
@@ -321,8 +378,52 @@ export async function verifyAuditChain(): Promise<{
   totalEntries: number;
   brokenLinkIndex?: number;
   message: string;
+  verifiedAs?: string;
+  seesWholeLedger?: boolean;
 }> {
   const logs = await getAuditLogs();
+  const health = getDbHealth();
+
+  if (health.storageMode === 'postgres-postgis') {
+    const visibility = await auditChainVisibility();
+    if (!visibility.seesWholeLedger) {
+      // Reported as a refusal, not as a failure of the chain and not as health: the chain may be
+      // perfectly intact, and this identity is simply not in a position to say so.
+      return {
+        isValid: false,
+        totalEntries: visibility.entriesSeen,
+        message: `NOT CERTIFIED: ${visibility.reason}. Run the check as the read-only verification identity: docker compose -f docker-compose.prod.yml --profile tools run --rm verify dist-server/verify_audit_chain.js`,
+        verifiedAs: visibility.verifiedAs,
+        seesWholeLedger: false,
+      };
+    }
+    if (logs.length === 0) {
+      return {
+        isValid: true,
+        totalEntries: 0,
+        message: 'Audit chain is empty — the ledger has never had an entry written to it.',
+        verifiedAs: visibility.verifiedAs,
+        seesWholeLedger: true,
+      };
+    }
+    // Entries cannot be deleted (the runtime role has no DELETE, and the 0001 append-only trigger
+    // refuses it for everyone), so ids run 1..N without holes. A count that does not match the highest
+    // id is therefore direct evidence that something was removed out of band — which is the one tamper
+    // mode the hash chain itself cannot show, because a deleted middle entry leaves the surviving
+    // neighbours still pointing at each other's successors only if the chain was rewritten; a plain
+    // deletion leaves a gap that the sequential walk above would already catch. This check catches the
+    // gap even when the walk starts at the genesis hash.
+    if (visibility.maxIdSeen !== visibility.entriesSeen) {
+      return {
+        isValid: false,
+        totalEntries: visibility.entriesSeen,
+        message: `BROKEN: the ledger holds ${visibility.entriesSeen} entries but its highest id is ${visibility.maxIdSeen} — entries were removed out of band`,
+        verifiedAs: visibility.verifiedAs,
+        seesWholeLedger: true,
+      };
+    }
+  }
+
   if (logs.length === 0) {
     return { isValid: true, totalEntries: 0, message: 'Audit chain is empty.' };
   }

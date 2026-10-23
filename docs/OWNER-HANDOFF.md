@@ -63,8 +63,9 @@ running, managed Postgres, and any object-store egress. The app itself never cal
 
 ## 3. Secrets: how to give the app its passwords without exposing them
 
-Four secrets are required. The code refuses to start without any of them — there is no default, so a
-missing one stops the deployment instead of quietly using a guess.
+Four secrets are required and one is optional-but-recommended. The code refuses to start without any of
+the required ones — there is no default, so a missing one stops the deployment instead of quietly using a
+guess.
 
 1. Generate the values **on the VM**, in the terminal, so they never sit in your browser history:
    ```bash
@@ -72,6 +73,7 @@ missing one stops the deployment instead of quietly using a guess.
    openssl rand -hex 32    # DHAROHAR_APP_PASSWORD (the API's runtime role; hex, not base64)
    openssl rand -hex 32    # JWT_SECRET         (signs login tokens)
    openssl rand -hex 12    # DEMO_PASSWORD      (demo personas only — never a real officer's password)
+   openssl rand -hex 32    # DHAROHAR_VERIFIER_PASSWORD (optional: the read-only checking identity)
    ```
 2. Write them into one file next to the compose file, then lock its permissions:
    ```bash
@@ -84,16 +86,27 @@ missing one stops the deployment instead of quietly using a guess.
    DHAROHAR_APP_PASSWORD=<paste>
    JWT_SECRET=<paste>
    DEMO_PASSWORD=<paste>
+   DHAROHAR_VERIFIER_PASSWORD=<paste, or leave the line out>
    EOF
    chmod 600 .env && ls -l .env      # must show -rw------- and your user as owner
    ```
    `.env` is gitignored and `.dockerignore` keeps it out of the images. Never paste these into a
    Dockerfile, compose file, commit, screenshot, chat message or ticket.
-3. There are deliberately **two** database passwords now. The owner one is used only by the one-shot
-   migration/grant containers; the API container physically cannot see it. That is the point.
+3. There are deliberately **three** database identities now.
+   * `dharohar` — the owner. Used only by the one-shot `migrate`, `roleinit` and `maint` containers; the
+     API cannot see this password.
+   * `dharohar_app` — the runtime role. No DDL, no TRUNCATE, no DELETE on records, subject to row-level
+     security.
+   * `dharohar_verifier` — **read-only, and the one you should run the checks with.** It can see every
+     row (including other tenants') because integrity checking has to, but it cannot write anything:
+     `roles.sql` creates it only when you supply the password, and refuses to finish if any write
+     privilege ends up on it. Without it the checks have to run as the owner, which is a credential that
+     could rewrite the audit chain.
 4. If a value ever appears in a terminal log, a chat or a commit: rotate it (put a new value in `.env`,
    run `docker compose -f docker-compose.prod.yml up -d` — `roleinit` reapplies it), then treat the old
-   one as known to whoever saw it.
+   one as known to whoever saw it. `docker inspect` on a running container prints its environment, so do
+   not pipe that into a log or a ticket; read a specific field with
+   `docker compose -f docker-compose.prod.yml exec api printenv PGUSER` instead.
 
 ---
 
@@ -105,10 +118,31 @@ docker compose -f docker-compose.prod.yml up -d --build
 docker compose -f docker-compose.prod.yml ps
 ```
 
-What happens by itself, in this order: `db` starts → `migrate` applies the five migrations as the
-owner and exits → `roleinit` creates/refreshes the least-privilege role and exits → `api` starts
-**as that role** and waits for `/api/health/ready` → `web` starts. If any step fails, the next one does
-not start; that is deliberate, so a half-built system never serves officers.
+What happens by itself, in this order: `db` starts → `migrate` applies the migrations as the owner and
+exits → `roleinit` creates/refreshes the least-privilege role (and the read-only verifier, if you gave it
+a password) and exits → `api` starts **as that role** and waits for `/api/health/ready` → `web` starts. If
+any step fails, the next one does not start; that is deliberate, so a half-built system never serves
+officers.
+
+**On a brand-new database, `migrate` stops at 0006 on purpose** with
+`[TENANCY_NO_CANONICAL_GEOGRAPHY]`. It is not a crash: 0006 assigns record ownership on the basis of
+which districts are authoritative, and a new database has no authoritative districts yet — geography is a
+statement a person makes, not something a deploy script invents. Say it, then finish:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  -e GEOGRAPHY_DISTRICTS="Jaipur,Ajmer,Jodhpur,Udaipur" \
+  -e GEOGRAPHY_ORGANIZATION=ORG-DHAROHAR-DEMO \
+  -e GEOGRAPHY_BY="<your name and address>" \
+  -e GEOGRAPHY_REASON="Rajasthan districts this register is filed under" \
+  maint dist-server/db/declareGeography.js
+docker compose -f docker-compose.prod.yml run --rm migrate     # now completes through 0009
+```
+
+Pick the districts that are actually authoritative for you; the four above are what the synthetic demo
+uses. The command refuses a blank or one-word reason, an organization that does not exist, and a name
+that collides with a district already in the registry — and it records who declared what, in the grant
+rows.
 
 Then load the demo data (this writes fabricated records — it refuses without the confirmation you see
 below, precisely so nobody runs it against real records by habit):
@@ -269,10 +303,29 @@ rclone copy /var/backups/dharohar "remote:dharohar-backups" --checksum
 
 Cron example (2:30 nightly, keep 30 days): see `docs/DEPLOYMENT.md` §8.
 
+**Checking the register's integrity, and checking the audit chain.** Run these as the read-only
+verifier, not as the owner and not as the API role:
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  verify dist-server/verify_audit_chain.js          # exit 0 = intact; prints how many entries it saw and as whom
+docker compose -f docker-compose.prod.yml --profile tools run --rm \
+  verify dist-server/verify_district_integrity.js   # the findings report; nothing is modified
+```
+
+Both print the identity they ran as, and both **refuse** rather than report if that identity cannot see
+the whole table. That refusal matters: a chain check run through a filtered connection sees fewer
+entries, finds no broken links among them, and reports a healthy chain — which is how this project once
+"found" 41 problems that did not exist. `./scripts/test-rls-blind-certifier.sh` demonstrates the refusal
+on a disposable copy, so the guard is proved rather than asserted.
+
 **Rollback of the software** (as opposed to the data): `docker compose -f docker-compose.prod.yml down`
 keeps the data volumes. Migrations are additive and forward-only — there is no automated down-migration,
 so rolling an *older* image against a newer database is supported only if that older code still matches
-the columns, which is why you take a verified dump **before** every upgrade.
+the columns, which is why you take a verified dump **before** every upgrade. Each migration also has a
+`rollback-NNNN.sql` in `server/src/db-draft/` that refuses to run unless it can reverse its own change
+without touching a human decision — 0006's won't erase an ownership assignment made by a person, 0007's
+won't run while a candidate district is unresolved, 0009's won't drop policies it did not create.
 
 Restore drill already executed on 2026-10-19 against a disposable database: 3 migrations present,
 33/33 parcel geometries valid, a 2,000,000-character document payload with an identical md5 in source
@@ -330,26 +383,45 @@ Do not read this document as a claim that these were tested. They were not:
   reasonable target but this has not been executed on Arm.
 * **Production capacity / concurrent officers.** The containers are capped at 0.75 vCPU and 512 MB each;
   no load test was performed.
-* **Real record volumes.** Every measurement in this document is on synthetic demo data — 39 parcels,
-  59 accounts.
-* **Row-level security: implemented on two tables, and only those.** `parcels` and `land_documents`
-  carry four tenant policies each and are verified as `dharohar_app` (no context → zero rows; forged
-  context → zero rows; `SET ROLE` refused). Nested tables (`parcel_owners`, `parcel_mutations`,
-  `field_inspections`, `user_jurisdictions`) have no policies of their own and are scoped through their
-  parcel; `users` has none because login must resolve the account before a tenant exists;
-  `append_only_audit_logs` has none because entries are scoped through the record they describe and
-  chain verification is whole-table by nature. That boundary is `docs/SECURITY.md` item 7, not a claim
-  that every table is covered.
+* **Real record volumes.** Every measurement in this document is on synthetic demo data — 42 parcels
+  (30 owned by the demo tenant, 12 quarantined), 45 documents, 59 accounts, 2,341 audit entries.
+* **Row-level security: five tables, and only those.** `parcels` and `land_documents` carry four tenant
+  policies each (0006); `parcel_owners`, `parcel_mutations` and `field_inspections` carry four each and
+  inherit their parcel's policy (0009). All of it is verified directly as `dharohar_app`: no context →
+  zero rows, forged context → zero rows, cross-tenant child write refused, `SET ROLE` refused. The
+  tables deliberately left without policies are `users`, `user_jurisdictions`, `user_capabilities` and
+  `organization_districts` — login has to read them to discover the tenant, so a tenant-keyed policy
+  would fail every sign-in — plus `districts` (shared geography), `organization_units` (no code reads
+  it) and `append_only_audit_logs` (chain verification is whole-table by nature). The reasoning, the
+  measured privileges and the queries that reproduce all of it are in
+  [docs/TENANT-DATA-ACCESS.md](TENANT-DATA-ACCESS.md). What is *not* verified is whether that boundary
+  is the right one for a department reviewer; it is a documented decision, not a tested requirement.
+* **An administrator password you have not supplied.** `./scripts/validate-stack.sh` runs **67 passed,
+  1 failed**, and the one failure is that `ADMIN_PASSWORD` was not exported, so the provisioning suite
+  did not run *against this live stack*. The same suite ran **91/0** against a disposable copy where the
+  harness bootstraps an administrator of its own (`./scripts/test-authorization-on-copy.sh`), so the
+  behaviour is tested; what is missing is the operator-side credential to run it on the deployment
+  itself. `db:bootstrap-admin` will not mint a second administrator, by design, and the existing
+  `sysadmin@dharohar.local` password is not the demo password (measured: HTTP 401). This is yours to
+  close, and it is a credential decision, not a code one.
 * **A copy on another machine.** `./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups` passed end
-  to end — dump, checksum, copy to a second volume, restore from that copy, payload digest and audit
-  chain compared — but D: is a different volume on the same physical laptop, and the archive is not
-  encrypted. `rclone`/B2/R2 with `--checksum` has not been executed, so "a copy exists outside this
-  machine" is still not true.
+  to end — dump, checksum sidecar, copy to a second volume, restore from that copy, payload digest and
+  the whole 2,341-entry chain compared — but D: is a different **volume on the same physical machine**,
+  and the archive is **not encrypted**. `rclone`/B2/R2 with `--checksum` has not been executed. Until
+  both are done, do not describe this as production-grade disaster recovery: the restore path is proven,
+  the durability and confidentiality of the archive are not.
 
-Everything claimed as *done* in this document is backed by a command in `docs/DEPLOYMENT.md` §9 or by the
-validation gate (`./scripts/validate-stack.sh` — **66 passed, 1 failed** on 2026-10-21, the one failure
-being that provisioning was not run against the live stack because no administrator password was
-exported; it ran green against a disposable copy), and by `./scripts/test-tenant-migration.sh`
-(**117 passed, 0 failed**, covering migrations 0004–0008 with rollback guards) and
-`./scripts/test-authorization-on-copy.sh` (jurisdiction 46/0, provisioning 91/0, tenancy 42/0 against a
-copy with the API running as `dharohar_app`).
+Everything claimed as *done* in this document is backed by a command in `docs/DEPLOYMENT.md` §9 and, as
+of 2026-10-24, by one full sweep run against the same build:
+
+| gate | measured |
+| --- | --- |
+| `./scripts/test-tenant-migration.sh` | **141 passed, 0 failed** (exit 0) — migrations 0004–0009, guards fired on purpose, rollbacks and re-applies |
+| `./scripts/test-fresh-install.sh` | **105 passed, 0 failed** (exit 0) — empty database to full schema, compared with an upgraded one, provisioning checked against the rows it writes, an aborted migration diagnosed and recovered |
+| `./scripts/test-authorization-on-copy.sh` | jurisdiction **46/0**, provisioning **91/0**, tenancy **68/0** (exit 0) |
+| `./scripts/test-rls-blind-certifier.sh` | all checks passed (exit 0) — the chain certifier refuses a partial read instead of reporting health |
+| `npm run lint`, `npm test` | exit 0 — tsc clean, phase 4 **47/0**, E2E **53/0** |
+| `verify dist-server/verify_audit_chain.js` | exit 0 — 2,341 entries, ids contiguous, **INTACT**, as `dharohar_verifier` |
+| `verify dist-server/verify_district_integrity.js` | exit 1 by design — **58 findings**, all accounted for in `docs/DISTRICT-INTEGRITY-REPORT.md` §6 |
+| `./scripts/validate-stack.sh` | **67 passed, 1 failed** — see the `ADMIN_PASSWORD` bullet above |
+| `./scripts/offsite-copy-drill.sh` | all checks passed (exit 0) — see the same-volume caveat above |

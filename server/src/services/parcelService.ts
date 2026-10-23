@@ -8,7 +8,7 @@
 
 import { PoolClient } from 'pg';
 import { pool, getDbHealth, memoryStore } from '../db/db';
-import { beginTenantTransaction } from '../db/tenant';
+import { beginTenantTransaction, tenantQuery } from '../db/tenant';
 import { recordAuditLog } from './auditService';
 import { validateParcel } from './validationService';
 import { generateCertificateNumber, signSeal } from '../utils/crypto';
@@ -361,11 +361,16 @@ export async function recordFieldInspection(options: {
 /**
  * Read inspections from PostgreSQL where it is the source of truth.
  */
-export async function fetchFieldInspections(parcelId: string): Promise<any[]> {
+export async function fetchFieldInspections(parcelId: string, principal: RequestPrincipal): Promise<any[]> {
   const health = getDbHealth();
 
   if (health.storageMode === 'postgres-postgis') {
-    const result = await pool.query(
+    // Read through the caller's tenant. A field inspection is a first-hand claim about a specific
+    // parcel — who stood on it, what they observed, the photo and its digest — so an unscoped read
+    // here would hand one tenant another tenant's survey evidence whenever the HTTP layer's parcel
+    // check passed for an unrelated reason.
+    const result = await tenantQuery(
+      principal,
       'SELECT * FROM field_inspections WHERE parcel_id = $1 ORDER BY inspected_at DESC',
       [parcelId]
     );

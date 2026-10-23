@@ -212,28 +212,35 @@ defect — but it is a real dependency for a government network.
      aggregates, and in `assertParcelReadable` / `assertParcelWritable` / `assertDocumentReadable` /
      `assertDocumentWritable` for every detail and nested path, so a route cannot omit it by forgetting
      to add it.
-   * **Layer two, PostgreSQL row-level security.** `parcels` and `land_documents` carry four policies
-     each (migration 0006), SELECT/INSERT/UPDATE/DELETE separately, requiring the session's organization
-     to match the row **and** to match what `users` says about the session's user id. The GUCs are set
-     with `set_config(..., true)` inside a transaction (`server/src/db/tenant.ts`), never at session
-     scope, so a pooled connection cannot hand its predecessor's tenant to a later request. Unbound
-     reads return zero rows: verified as the runtime role directly, not inferred.
+   * **Layer two, PostgreSQL row-level security.** Five tables are covered. `parcels` and
+     `land_documents` carry four policies each (migration 0006), SELECT/INSERT/UPDATE/DELETE separately,
+     requiring the session's organization to match the row **and** to match what `users` says about the
+     session's user id. `parcel_owners`, `parcel_mutations` and `field_inspections` carry four policies
+     each (migration 0009) whose predicate is *the parent parcel must be visible* — the children hold no
+     tenant column of their own, so they inherit tenancy from the record they belong to rather than
+     restating it. The GUCs are set with `set_config(..., true)` inside a transaction
+     (`server/src/db/tenant.ts`), never at session scope, so a pooled connection cannot hand its
+     predecessor's tenant to a later request. Unbound reads return zero rows: verified as the runtime
+     role directly, not inferred.
    * **What a refusal looks like.** Another tenant's record and a record that does not exist produce the
      same bytes; an officer whose account has no organization gets `403 TENANT_CONTEXT_MISSING` because
      that is a configuration someone must be able to see.
-   * **Not covered by the second layer, stated plainly.** `parcel_owners`, `parcel_mutations`,
-     `field_inspections` and `user_jurisdictions` have no owner column of their own and no policies; they
-     are scoped through the parcel they hang off, which is RLS-covered, plus the application checks.
-     `users` has no policy because login must resolve the account before any tenant context exists.
-     `append_only_audit_logs` has no policy because entries attached to a parcel are scoped through it
-     (migration 0008 adds actor attribution for the rest) and because chain verification is inherently
-     whole-table.
+   * **What is deliberately outside the second layer.** `users`, `user_jurisdictions`,
+     `user_capabilities` and `organization_districts` have no policies because `loadPrincipal` reads them
+     to *discover* the tenant before any context exists; a policy keyed on that context would be a closed
+     loop that fails every login. `districts` is shared geography — two tenants may legitimately hold
+     grants on the same district. `append_only_audit_logs` has no policy because chain verification is
+     inherently whole-table, and a filtered chain read reports health about the rows it did not receive
+     (`scripts/test-rls-blind-certifier.sh` proves the certifier refuses instead). `organization_units`
+     has no policy because nothing in the application reads or writes it yet — measured, not assumed.
+     The full table-by-table reasoning, with the queries that reproduce it, is `docs/TENANT-DATA-ACCESS.md`.
    Measured on a disposable copy with `./scripts/test-authorization-on-copy.sh`:
-   `test:jurisdiction` 46/0, `test:provisioning` 91/0, `test_tenancy_isolation_suite.ts` 42/0 — including
+   `test:jurisdiction` 46/0, `test:provisioning` 91/0, `test_tenancy_isolation_suite.ts` 68/0 — including
    two tenants granted the same district each reading only their own parcel, listings, search, nested
    document and inspection routes, the officer roster, registry counts, cross-tenant document download,
-   grant revocation, `audits` opening reads but never writes, and direct SQL as `dharohar_app` with no
-   context, with a forged context, and attempting `SET ROLE` to the owner.
+   grant revocation, `audits` opening reads but never writes, the child tables read directly as
+   `dharohar_app` with no context, with a forged context, and written cross-tenant, a role changed in
+   the database while its token stayed valid, and a pooled connection checked for tenant carry-over.
 7b. **Document bytes are stored, retrieved and now round-trip verified.** Re-measured on 2026-10-21: a
    2,000,000-byte payload written through `POST /api/documents` was read back and hashed to the same
    digest at rest, and the same payload survived `pg_dump` → second-location copy → restore → compare
@@ -241,17 +248,17 @@ defect — but it is a real dependency for a government network.
    holds no *scanned* record images beyond those written by the drills, so "the documents are archived"
    remains false about the demo content even though the storage path works — that is an intake gap, and
    the audit trail of a seal over an absent image is still unverifiable.
-7b. **The deployed register contains no document images at all.** Measured on 2026-10-19: every
-   `land_documents` row in the deployment has an empty `image_uri` — OCR text and metadata, no source
-   bytes. The one exception is the 1.5 MB payload written deliberately as a backup-drill fixture, and
-   it is synthetic.
+7c. **The deployed register still contains no scanned record images.** Re-measured on 2026-10-23: of 45
+   `land_documents` rows, exactly 2 carry a payload over 100 KB — both written deliberately as backup
+   and persistence fixtures (`bytes-proof-*`, `persist_probe.pdf`), both synthetic. The other 43 hold OCR
+   text and metadata with an empty `image_uri`.
    Nothing is broken in the storage path (a 1.5 MB payload written through the API round-tripped
    through backup and restore with an identical digest), but a record set without its source images is
    not digitized land records, and any "documents are preserved" statement about the current data is
    false by vacuity. This is an operational gap in how the demo data was created, not a defect — and
    it must be closed with real uploads before the first pilot, because the audit trail of a seal over
    an absent image is unverifiable.
-7c. **Production UI now fails closed when the API is unavailable.** Measured with the API stopped and
+7d. **Production UI now fails closed when the API is unavailable.** Measured with the API stopped and
    the built bundle served by nginx: sign-in is refused, the session flag stays false, and a
    persistent `role=status` panel says the server is unreachable rather than letting the officer
    discover it later. Previously a connection refusal authenticated into a *demo* workstation whose

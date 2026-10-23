@@ -27,7 +27,7 @@
  *   npx tsx server/src/test_tenancy_isolation_suite.ts
  */
 
-import { Client } from 'pg';
+import { Client, Pool } from 'pg';
 
 const BASE_URL = process.env.TEST_BASE_URL || 'http://localhost:3001/api';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'sysadmin@dharohar.local';
@@ -157,6 +157,38 @@ async function main() {
       where d.code = 'udaipur' and d.kind = 'canonical' and p.is_archived = false order by p.id limit 1`
   );
   const udaipurParcel = udParcels.rowCount! > 0 ? udParcels.rows[0].id as string : null;
+
+  // Child records: a parcel's co-sharers and its mutation history carry no tenant column of their own.
+  // Their tenant IS their parcel's tenant, which is what migration 0009 enforces in the database
+  // instead of leaving it to the query that happens to join them. The probes in section 5 need rows
+  // to find, so plant one of each per parcel — and prove they are there before asserting they are
+  // invisible.
+  for (const [parcel] of [[demoParcel], [otherParcel]] as const) {
+    await db.query(
+      `insert into parcel_owners (id, parcel_id, name, relation_type, status)
+       values ($1, $2, $3, 'self', 'Active Co-sharer') on conflict (id) do nothing`,
+      [`OWN-TENANCY-${run}-${parcel.slice(-6)}`, parcel, `Suite co-sharer of ${parcel}`]
+    );
+    await db.query(
+      `insert into parcel_mutations (parcel_id, mutation_date, mutation_type, note, recorded_by)
+       values ($1, current_date, 'NAME_CHANGE', $2, 'tenancy-suite')`,
+      [parcel, `Tenancy suite ${run}: mutation planted to prove child-row scoping`]
+    );
+    await db.query(
+      `insert into field_inspections (id, parcel_id, inspected_by, discrepancy_observed, is_provisional)
+       values ($1, $2, $3, false, true) on conflict (id) do nothing`,
+      [`INS-TENANCY-${run}-${parcel.slice(-6)}`, parcel, `tenancy-suite survey officer`]
+    );
+  }
+  const childPremise = await db.query(
+    `select (select count(*) from parcel_owners where parcel_id = any($1::text[]))::int as owners,
+            (select count(*) from parcel_mutations where parcel_id = any($1::text[]))::int as mutations,
+            (select count(*) from field_inspections where parcel_id = any($1::text[]))::int as inspections`,
+    [[demoParcel, otherParcel]]
+  );
+  assert(childPremise.rows[0].owners >= 2 && childPremise.rows[0].mutations >= 2 && childPremise.rows[0].inspections >= 2,
+    'premise: both tenants hold child rows in all three tables that the probes below claim to hide',
+    JSON.stringify(childPremise.rows[0]));
 
   // ---- 1. cross-tenant access in a shared district ---------------------------
   console.log('\n1. TWO TENANTS GRANTED THE SAME DISTRICT (the requirement RLS exists for)');
@@ -432,6 +464,77 @@ async function main() {
     'the same role, honestly bound, sees its own tenant\'s rows and only those',
     `rows=${honestRows} own=${honestIds.includes(otherParcel)} foreign=${honestIds.includes(demoParcel)}`);
 
+  // The payload of a record lives in its children: who the co-sharers are, what changed and when, what
+  // the survey found. Those rows hold no tenant column of their own, so the only thing standing
+  // between one tenant and another\'s is the policy on the parent. Measured without the application
+  // in the path, because the application is the layer whose bypass these probes exist to test.
+  for (const childTable of ['parcel_owners', 'parcel_mutations', 'field_inspections']) {
+    const naked = await app.query(`select count(*)::int n from ${childTable}`);
+    assert(naked.rows[0].n === 0,
+      `with NO tenant context the role reads zero rows from ${childTable} — a child is unreachable until its parcel is`,
+      `got ${naked.rows[0].n}`);
+  }
+
+  // Counted from the owner side, so "invisible" is measured against rows that are demonstrably there
+  // rather than against a table that happens to be empty.
+  const otherOwnerRows = (await db.query('select count(*)::int n from parcel_owners where parcel_id = $1', [otherParcel])).rows[0].n as number;
+  const demoOwnerRows = (await db.query('select count(*)::int n from parcel_owners where parcel_id = $1', [demoParcel])).rows[0].n as number;
+  assert(otherOwnerRows > 0 && demoOwnerRows > 0,
+    `premise: both parcels have co-sharer rows to hide (${otherParcel}=${otherOwnerRows}, ${demoParcel}=${demoOwnerRows})`);
+
+  let ownChildren = -1, foreignChildren = -1;
+  await app.query('BEGIN');
+  await app.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [OTHER_TENANT, bUserId]);
+  ownChildren = (await app.query('select count(*)::int n from parcel_owners where parcel_id = $1', [otherParcel])).rows[0].n;
+  foreignChildren = (await app.query('select count(*)::int n from parcel_owners where parcel_id = $1', [demoParcel])).rows[0].n;
+  const ownMutations = (await app.query('select count(*)::int n from parcel_mutations where parcel_id = $1', [otherParcel])).rows[0].n;
+  const foreignMutations = (await app.query('select count(*)::int n from parcel_mutations where parcel_id = $1', [demoParcel])).rows[0].n;
+  const allVisibleMutations = (await app.query('select count(*)::int n from parcel_mutations')).rows[0].n;
+  const ownInspections = (await app.query('select count(*)::int n from field_inspections where parcel_id = $1', [otherParcel])).rows[0].n;
+  await app.query('ROLLBACK');
+  assert(ownChildren === otherOwnerRows,
+    'the second tenant\'s own co-sharers are readable through its own context',
+    `expected ${otherOwnerRows}, got ${ownChildren}`);
+  assert(foreignChildren === 0,
+    'and the first tenant\'s co-sharers are not — reading the child requires reading the parcel',
+    `got ${foreignChildren}`);
+  assert(ownMutations > 0 && foreignMutations === 0 && allVisibleMutations === ownMutations,
+    'mutation history: the tenant sees its own and nothing else, in total as well as per parcel',
+    `own=${ownMutations} foreign=${foreignMutations} visible-total=${allVisibleMutations}`);
+  assert(ownInspections > 0,
+    'the survey evidence of its own parcel is readable by the owning tenant',
+    `got ${ownInspections}`);
+
+  // A context that pairs one tenant with an officer of another is the forgery the root policy already
+  // refuses; the children must refuse it identically rather than fall back to the parent being visible.
+  let forgedChildren = -1;
+  await app.query('BEGIN');
+  await app.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [DEMO_TENANT, bUserId]);
+  forgedChildren = (await app.query(
+    'select ((select count(*) from parcel_owners) + (select count(*) from parcel_mutations) + (select count(*) from field_inspections))::int as n'
+  )).rows[0].n;
+  await app.query('ROLLBACK');
+  assert(forgedChildren === 0,
+    'a forged tenant/user pair reads zero child rows from all three tables',
+    `got ${forgedChildren}`);
+
+  // Writing a child row is the other half: a tenant must not be able to attach its own co-sharers to
+  // another tenant\'s parcel, or move a parcel\'s history under a parcel it cannot see.
+  await app.query('BEGIN');
+  await app.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [OTHER_TENANT, bUserId]);
+  let crossInsert = 'applied';
+  try {
+    await app.query(
+      `insert into parcel_owners (id, parcel_id, name, relation_type) values ($1, $2, $3, 'self')`,
+      [`OWN-CROSS-${run}`, demoParcel, `Row another tenant tried to attach to ${demoParcel}`]
+    );
+  } catch (err: any) {
+    crossInsert = /violates row-level security/.test(String(err.message)) ? 'refused' : String(err.message).slice(0, 70);
+  }
+  await app.query('ROLLBACK');
+  assert(crossInsert === 'refused',
+    'row-level security refuses a child row whose parent belongs to someone else', crossInsert);
+
   let roleSwitch = '';
   try {
     await app.query('set role dharohar');
@@ -485,6 +588,120 @@ async function main() {
   assert(bAfterPersonalRevoke.status === 404,
     'a personal revocation removes access even while the tenant still holds the district',
     `got ${bAfterPersonalRevoke.status}`);
+
+  // ---- 7. authorization reads the database, not the token -------------------
+  // A token is an identity claim with a lifetime; a role, a posting and a capability are facts in the
+  // database. The requirement is that changing the fact changes the access on the next request,
+  // without waiting for the token to expire — and that the refusal names the role the database holds,
+  // not the one the token asserts.
+  console.log('\n7. STALE CREDENTIALS (a demoted officer must lose access while the token is still valid)');
+  const stale = await makeOfficer('stale', ['Jaipur']);
+  assert(stale.status === 201, 'premise: a writable officer is created', `got ${stale.status}`);
+  const staleToken = await login(stale.email, stale.password);
+
+  const beforeDemote = await call(`/parcels/${demoParcel}`, {
+    token: staleToken, method: 'PATCH', body: { tehsil: `tenancy-before-demotion` },
+  });
+  assert(beforeDemote.status === 200,
+    'control: while the database still says TEHSILDAR, the same token may write',
+    `got ${beforeDemote.status} ${JSON.stringify(beforeDemote.body?.error || {})}`);
+
+  await db.query(`update users set role = 'AUDITOR' where id = $1`, [stale.id]);
+  const afterDemote = await call(`/parcels/${demoParcel}`, {
+    token: staleToken, method: 'PATCH', body: { tehsil: `tenancy-after-demotion` },
+  });
+  const staleRoleCode = codeOf(afterDemote);
+  // READ_ONLY_ROLE is the strongest possible evidence for this requirement: the token still asserts
+  // TEHSILDAR, and only an identity read from the database after the demotion can produce an
+  // auditor-shaped refusal. denyReadOnly runs before requireRole, so this is the gate that speaks.
+  assert(afterDemote.status === 403 && staleRoleCode === 'READ_ONLY_ROLE',
+    'demoted in the database, the still-valid token is refused for being an auditor it never claimed',
+    `got ${afterDemote.status} ${staleRoleCode}`,
+  );
+  // The refusal has to be the role and not a general lockout: an auditor still READS the same record.
+  const demotedRead = await call(`/parcels/${demoParcel}`, { token: staleToken });
+  assert(demotedRead.status === 200,
+    'control: the same token still reads the parcel as an auditor, so the write refusal came from the role',
+    `got ${demotedRead.status} ${codeOf(demotedRead)}`);
+  assert(demotedRead.body?.data?.parcel?.id === demoParcel,
+    'and the read carries the record itself, not just a success flag',
+    JSON.stringify(demotedRead.body?.data?.parcel?.id ?? demotedRead.body?.data));
+
+  // The read-only gate has to bite on the document paths too, not only on parcels — and specifically
+  // because of the gate: the response code names READ_ONLY_ROLE, which the tenancy checks do not emit.
+  const auditorLink = await call(`/documents/${docId}/link`, {
+    token: staleToken, method: 'POST', body: { parcelId: demoParcel },
+  });
+  assert(auditorLink.status === 403 && codeOf(auditorLink) === 'READ_ONLY_ROLE',
+    'an auditor is refused by the read-only gate on the link route, not by a district or tenant check',
+    `got ${auditorLink.status} ${codeOf(auditorLink)}`);
+
+  await db.query(`update users set role = 'TEHSILDAR' where id = $1`, [stale.id]);
+  const afterRestore = await call(`/parcels/${demoParcel}`, {
+    token: staleToken, method: 'PATCH', body: { tehsil: `tenancy-role-restored` },
+  });
+  assert(afterRestore.status === 200,
+    'control: restoring the role restores the access, so the refusal above was the role and not the token',
+    `got ${afterRestore.status}`);
+
+  // Capability, not just role: USER_ADMIN is what opens the roster, and revoking it must close it again.
+  const adminRoster = await call('/admin/officers', { token: staleToken });
+  assert(adminRoster.status === 403,
+    'an officer who never held USER_ADMIN cannot list the roster',
+    `got ${adminRoster.status}`);
+
+  // ---- 8. a pooled connection cannot carry a tenant into the next borrower ---
+  // `set_config(..., true)` is transaction-scoped. If the tenant GUC survived a commit and a release,
+  // the next request that reuses that pooled backend would run inside someone else\'s tenant. Measured
+  // on a pool of exactly one connection so the reuse is guaranteed rather than hoped for.
+  console.log('\n8. POOLED CONNECTION CONTEXT LIFETIME');
+  const soloPool = new Pool({ connectionString: APP_URL, max: 1 });
+  const adminId = (await db.query('select id from users where email = $1', [ADMIN_EMAIL])).rows[0]?.id as string | undefined;
+  assert(!!adminId, 'premise: the administering officer used for the pool probe resolves to an id');
+  const borrower1 = await soloPool.connect();
+  await borrower1.query('BEGIN');
+  await borrower1.query(`select set_config('app.organization_id', $1, true), set_config('app.user_id', $2, true)`, [DEMO_TENANT, adminId]);
+  const bound = await borrower1.query(
+    `select current_setting('app.organization_id', true) as org, pg_backend_pid() as pid`);
+  const boundRows = await borrower1.query('select count(*)::int n from parcels');
+  await borrower1.query('COMMIT');
+  borrower1.release();
+
+  assert(String(bound.rows[0].org) === DEMO_TENANT && boundRows.rows[0].n > 0,
+    'premise: inside the transaction the context was really bound and really filtered',
+    `org=${bound.rows[0].org} rows=${boundRows.rows[0].n}`);
+
+  const borrower2 = await soloPool.connect();
+  const after = await borrower2.query(
+    `select coalesce(current_setting('app.organization_id', true), '<unset>') as org,
+            coalesce(current_setting('app.user_id', true), '<unset>') as usr,
+            pg_backend_pid() as pid,
+            (select count(*) from parcels)::int as visible`);
+  assert(String(after.rows[0].pid) === String(bound.rows[0].pid),
+    'premise: the second borrower got the SAME backend — otherwise this proves nothing about reuse',
+    `first=${bound.rows[0].pid} second=${after.rows[0].pid}`);
+  assert(after.rows[0].org === '<unset>' || after.rows[0].org === '',
+    'the committed transaction\'s organization did not survive into the next borrower',
+    `org=${after.rows[0].org}`);
+  assert(after.rows[0].usr === '<unset>' || after.rows[0].usr === '',
+    'nor did its user identity', `usr=${after.rows[0].usr}`);
+  assert(after.rows[0].visible === 0,
+    'and the borrowed connection therefore sees zero records until a context is bound',
+    `got ${after.rows[0].visible}`);
+  borrower2.release();
+
+  // A rolled-back transaction must clear the same way — a partial write is the case people worry about.
+  const borrower3 = await soloPool.connect();
+  await borrower3.query('BEGIN');
+  await borrower3.query(`select set_config('app.organization_id', $1, true)`, [DEMO_TENANT]);
+  await borrower3.query('ROLLBACK');
+  borrower3.release();
+  const borrower4 = await soloPool.connect();
+  const afterRollback = await borrower4.query(`select coalesce(current_setting('app.organization_id', true),'<unset>') as org`);
+  assert(afterRollback.rows[0].org === '<unset>' || afterRollback.rows[0].org === '',
+    'a rolled-back transaction leaves no tenant behind either', `org=${afterRollback.rows[0].org}`);
+  borrower4.release();
+  await soloPool.end();
 
   // ---- teardown on the copy --------------------------------------------------
   try {
