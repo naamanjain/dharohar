@@ -18,8 +18,10 @@ exclude_paths:
 
   # npm's own integrity records. sha512 digests of published tarballs, machine-generated, rotated on
   # every install; they are checksums of public artefacts, not secrets.
+  # bun.lock was listed here too; removed 2026-10-25 when the 0-byte bun.lock was deleted as a
+  # disposable artifact — npm's package-lock.json is the only lockfile this repository tracks, and an
+  # exclusion for a file that does not exist is a claim nobody can check.
   - package-lock.json
-  - bun.lock
 
   # Generated build output.
   - dist/**

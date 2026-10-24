@@ -631,7 +631,7 @@ filter over the rendered compose file that failed because YAML renders `DATABASE
 `KEY=value`. `scripts/rotate-app-credential.sh` now does the rotation with rails on, and this is what it
 measured: the injection map (one source in `.env`, three live holders, and the API container holding the
 value in `DATABASE_URL` and `PGPASSWORD` but **not** in `DHAROHAR_APP_PASSWORD` — its digest there was the
-empty string), the pre-rotation SCRAM verifier digest `d29e4294…` → post-rotation `ee2f310a…`, every
+empty string), the `roleinit` exit code, every
 *other* secret's digest unchanged before and after (`88b98d72b991` both sides, and the file grew by
 exactly the length difference, 574 → 606 bytes), the old credential refused with
 `FATAL: password authentication failed for user "dharohar_app"`, the new one authenticating, then the
@@ -639,6 +639,11 @@ API recreated and `/api/health/ready` returning 200 — the endpoint that probes
 `/api/health`, which reports the boot mode. Neither value was ever printed, passed as an argument, or
 written to a file; the tests piped them through `psql -W` on stdin. (`-w` is the opposite of `-W`: it
 means never prompt, and every attempt then fails with `fe_sendauth: no password supplied`.)
+`md5(rolpassword)` was first recorded here as proof the credential changed. Re-tested on 2026-10-24 it is
+**no proof at all**: `ALTER ROLE … PASSWORD` re-salts SCRAM, so the digest moves on a no-op re-apply of an
+unchanged password — `ee2f310a… → 63a84458… → e9a25f43…` across three runs of one value, each followed by
+the same successful authentication. Authenticating in both directions is the only proof, and the script
+now prints the digest with that caveat attached.
 
 The value is not in the working tree, not in any commit, and not in the session logs — checked by
 matching each live value against every file and every blob of the last four commits, with a control that

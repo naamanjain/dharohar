@@ -191,8 +191,13 @@ What it does, and how each step is proved rather than asserted (this is the run 
    and a digest over *all the other* secrets is equal before and after
    (`88b98d72b991` on both sides).
 3. **Re-assert the role** through the supported path: `docker compose -f docker-compose.prod.yml up -d
-   roleinit`. Proof: exit 0, and `md5(rolpassword)` of `dharohar_app` in `pg_authid` changes
-   (`d29e4294…` → `ee2f310a…`). That digest is of the SCRAM verifier, not the password.
+   roleinit`. Proof: exit 0. **Do not use `md5(rolpassword)` as proof that the credential changed** —
+   `ALTER ROLE … PASSWORD` re-salts SCRAM on every execution, so a no-op re-apply of the *same* password
+   moves the digest too. Measured on 2026-10-24 across three re-applications of one unchanged value:
+   `ee2f310a…` → `63a84458…` → `e9a25f43…`, with the same password authenticating after each. The digest
+   tells you `roleinit` ran; only step 4 tells you the credential rotated. (The first version of this
+   runbook cited the digest change as proof of rotation. It was wrong, and it was wrong in the direction
+   that matters: a check that passes when nothing happened.)
 4. **Test both directions** — the step that separates a rotation from a hope:
 
    ```bash

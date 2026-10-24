@@ -109,7 +109,11 @@ RI_RC=$?
 [ $RI_RC -eq 0 ] && good "roleinit exited 0" || bad "roleinit exited $RI_RC"
 grep -qiE 'LOCKDOWN_FAILED|ERROR|FATAL' ./.rotate-roleinit.log && { note "roleinit output contained errors:"; grep -iE 'LOCKDOWN_FAILED|ERROR|FATAL' ./.rotate-roleinit.log | head -5 | sed 's/^/    /'; FAILED=$((FAILED+1)); }
 VERIFIER_AFTER="$(docker exec "$DB_CONTAINER" psql -U "$DB_OWNER" -d "$DB_NAME" -tAc "select coalesce(md5(rolpassword),'none') from pg_authid where rolname='$APP_ROLE'" 2>/dev/null)"
-[ "$VERIFIER_AFTER" != "$VERIFIER_BEFORE" ] && good "the stored verifier for $APP_ROLE changed ($VERIFIER_BEFORE → $VERIFIER_AFTER)" || bad "the stored verifier is unchanged — ALTER ROLE did not apply"
+# This line proves roleinit RAN. It does NOT prove the password changed: ALTER ROLE … PASSWORD re-salts
+# SCRAM every time, so a no-op re-apply with the same value moves this digest too — measured on
+# 2026-10-24, ee2f310a… → 63a84458… → e9a25f43… across re-applications of one unchanged password.
+# The proof of the rotation is step 3, which authenticates with the new value and is refused with the old.
+[ "$VERIFIER_AFTER" != "$VERIFIER_BEFORE" ] && good "roleinit re-applied ALTER ROLE (SCRAM verifier digest $VERIFIER_BEFORE → $VERIFIER_AFTER; re-salted on every run, so this is evidence the step executed, not that the value changed)" || bad "the stored verifier is unchanged — ALTER ROLE almost certainly did not run"
 
 # ---- 3. the two directions that make this a rotation -------------------------
 echo ""
