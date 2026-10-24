@@ -85,6 +85,7 @@ from the script itself, not from a pipe that could mask them (that masking bit t
 | `./scripts/encrypted-backup-drill.sh` | **38 checks** — see §5 | 0 |
 | `./scripts/offsite-copy-drill.sh --dest D:/dharohar-backups` | all checks passed; **the destination is a second volume of the same machine**, and the script says so | 0 |
 | `./scripts/validate-stack.sh` | **68 passed, 1 failed** of 69 checks — the one failure is the `ADMIN_PASSWORD` skip in §8; the suite-residue retirement step that migration 0010 had broken now passes again | 1 |
+| `npm ci` from an empty `node_modules`, then `npm run lint` and `npm run test:phase4` again | 207 packages installed; lint clean; phase 4 passes — the retained dependency tree is genuinely reproducible from the tracked `package-lock.json`, which is what §11's claim of "regenerable" requires before it can be believed | 0 |
 | `verify dist-server/verify_audit_chain.js` (as `dharohar_verifier`) | 2,874 entries, **INTACT** | 0 |
 | `verify dist-server/verify_district_integrity.js` (as `dharohar_verifier`) | **58 findings** — 54 locked suite-created accounts, 2 documents with neither a district nor a parcel, 2 documents unowned and unlinked, the rest dispositioned in `docs/DISTRICT-INTEGRITY-REPORT.md` §6. A non-zero exit is the designed behaviour of a findings report (`evidence/13-integrity.log`) | 1 |
 | Secret scan of working tree + all reachable history (§6) | 0 live values; controls pass | 0 |
@@ -347,8 +348,11 @@ Removed, each after confirming it is regenerable or has no referents (repo size 
 
 Kept, deliberately:
 
-* `node_modules/` (257 MB) — regenerable from the tracked `package-lock.json`, but the verification suite
-  in this same pass runs against it. `npm ci` reproducibility is the last item in §12.
+* `node_modules/` (257 MB) — regenerable from the tracked `package-lock.json`, and **proven so**: after
+  every gate had run, the directory was deleted, `npm ci` rebuilt it (207 packages, exit 0) and
+  `npm run lint` plus `npm run test:phase4` passed again against the reinstalled tree
+  (`evidence/14-npm-ci.log`, `evidence/15-lint-after-ci.log`). It is kept because the next gate run
+  needs it, not because anyone believes it is irreplaceable.
 * `backups/` (76 dumps, ~19 MB, **0 byte-identical duplicates**) and `backups-pre0003/` (the pre-0003
   baseline dump). A blocked external-backup test is not a reason to delete a backup.
 * `.env`, `.env.local-credentials-preserve-me` — untracked and ignored; the second is the owner's own
@@ -378,9 +382,15 @@ npm run test:registry                                   # needs REGISTRY_ADMIN_U
 docker compose -f docker-compose.prod.yml --profile tools run --rm verify dist-server/verify_audit_chain.js
 ```
 
-Outstanding: `npm ci` from an empty `node_modules` to prove the lockfile reproduces the toolchain
-(registry reachability confirmed by probe; the reinstall itself was not run in this pass, so the tree
-that produced these results is the one that was installed before it).
+The dependency-tree reproducibility step was the last one outstanding when this section was first
+written, so it was executed rather than deferred: `rm -rf node_modules && npm ci` rebuilt 207 packages
+and `npm run lint` and `npm run test:phase4` passed against the fresh install.
+
+Still genuinely unrun, and not pretending otherwise: the live-stack provisioning leg behind
+`ADMIN_PASSWORD` (§8), any transfer to an external backup destination (§5), the GitHub secret-scanning
+alert list (`gh` not installed), an ARM architecture build, TLS/DNS verification from outside this
+network, load and capacity under real traffic, a real department IdP round trip, and browser-level
+verification of the SPA itself — the UI checks in this audit are HTTP- and database-level, not visual.
 
 ---
 
@@ -405,8 +415,9 @@ the kind of thing a green suite can hide.
 | --- | --- |
 | Pushed | `git push origin main`, normal push, no `--force`, no history rewrite, no visibility change, no remote branch deleted |
 | Moved | `459f3b8` → `22650f1` (seven commits went up: the remote had not been updated since the tenant-model work began, because every earlier phase was explicitly un-pushed by the owner) |
-| Audited code candidate | `22650f1` — the commit this report was written in |
-| Verified on the server | `git ls-remote --heads origin` returned `22650f1fd3135b726fa3313d2a33d05dc0430469` for `refs/heads/main`; `git status -sb` then showed `## main...origin/main` with no ahead/behind |
+| Audited code candidate | `22650f1` — the commit carrying this report and every change measured above |
+| Documentation-only follow-ups | `4186bf1` (§14's push outcome) and one more after it (§3's `npm ci` row, §11 and §12). `git diff --name-only 22650f1 HEAD` lists **this file alone**, so the packaged code and the audited code are the same tree — checked, not asserted. |
+| Verified on the server | `git ls-remote --heads origin` matched the pushed hash each time; `git status -sb` then showed `## main...origin/main` with no ahead/behind. The ZIP is `git archive` of the final `main`, named in `PACKAGE_INFO.txt`. |
 | Server-side secret scanning | The push was accepted. That is **not** proof GitHub found nothing: push protection can be warn-only or off on a private repository, and `gh` is not installed here, so the alert list could not be read. The local audit in §6 is the evidence; this line only records that nothing blocked the push. |
 | What was **not** done | no deployment, no container started on any public host, no DNS record created, no real record entered, `WEB_BIND` left at its loopback default |
 
