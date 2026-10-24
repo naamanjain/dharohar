@@ -401,5 +401,15 @@ the kind of thing a green suite can hide.
 
 ## 14. Push outcome
 
-_(recorded in the same commit as the report, after the push: branch, remote commit hash, and
-`git status -sb` confirmation that `main` and `origin/main` match.)_
+| | |
+| --- | --- |
+| Pushed | `git push origin main`, normal push, no `--force`, no history rewrite, no visibility change, no remote branch deleted |
+| Moved | `459f3b8` → `22650f1` (seven commits went up: the remote had not been updated since the tenant-model work began, because every earlier phase was explicitly un-pushed by the owner) |
+| Audited code candidate | `22650f1` — the commit this report was written in |
+| Verified on the server | `git ls-remote --heads origin` returned `22650f1fd3135b726fa3313d2a33d05dc0430469` for `refs/heads/main`; `git status -sb` then showed `## main...origin/main` with no ahead/behind |
+| Server-side secret scanning | The push was accepted. That is **not** proof GitHub found nothing: push protection can be warn-only or off on a private repository, and `gh` is not installed here, so the alert list could not be read. The local audit in §6 is the evidence; this line only records that nothing blocked the push. |
+| What was **not** done | no deployment, no container started on any public host, no DNS record created, no real record entered, `WEB_BIND` left at its loopback default |
+
+The following documentation-only commit completes this section; `git diff --name-only` between it and
+`22650f1` lists exactly this file, which is how the ZIP's claim that it contains the audited *code* is
+checked rather than asserted.
