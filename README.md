@@ -65,7 +65,7 @@ deliberately not published here.
 
 | Document | Contents |
 | --- | --- |
-| [Evaluation package](./docs/evaluation/DHAROHAR_EVALUATION_PACKAGE.md) | Problem statement, proposed solution, system architecture and diagram, module documentation, technology stack, data model, API reference, security and privacy architecture, deployment overview, testing methodology with dated results, limitations and roadmap, demonstration instructions |
+| [Evaluation package](./docs/EVALUATION_PACKAGE.md) | Problem statement, proposed solution, system architecture and diagram, module documentation, technology stack, data model, API reference, security and privacy architecture, deployment overview, testing methodology with dated results, limitations and roadmap, demonstration instructions |
 | [Verification queries](./docs/security/LIVE_AUDIT_READONLY_QUERIES_2026-10-30.sql) | The read-only SQL used to reconcile application claims against the database |
 
 ## Architecture at a glance
