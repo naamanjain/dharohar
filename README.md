@@ -19,25 +19,42 @@
   <strong>Try the deployed application:</strong>
   <a href="https://dharohar.urbantechx.in">Launch DHAROHAR ↗</a>
   &nbsp;·&nbsp;
-  <a href="./docs/EVALUATION_PACKAGE.md">Explore the architecture and evaluation</a>
+  <a href="./docs/DEMONSTRATION_GUIDE.md">Reviewer walkthrough</a>
+  &nbsp;·&nbsp;
+  <a href="./docs/ARCHITECTURE_OVERVIEW.md">Architecture</a>
 </p>
 
-**Live demonstration:** https://dharohar.urbantechx.in  
-**Project status:** deployed prototype on synthetic data · Hindi and English
+**Project status:** deployed prototype on synthetic demonstration data · Hindi and English
 
-> **Support DHAROHAR:** If you find this project interesting, please [give the public project repository a star on GitHub](https://github.com/naamanjain/dharohar). It helps others discover the project and supports the documentation/evaluation work.
+DHAROHAR is a revenue-officer workstation for digitising, checking and reviewing land-record information. It brings together browser-based OCR, structured revenue fields, arithmetic validation, parcel geometry, document workflows, human review and an auditable history.
 
-DHAROHAR is a revenue-officer workstation for digitising, checking and reviewing land-record information. It combines browser-based OCR, structured revenue data, arithmetic validation, parcel boundaries, human review and an auditable record of consequential actions.
+> **Important:** DHAROHAR is an independent prototype using synthetic demonstration data. It is not an official government land-record system, does not establish legal ownership, and is not connected to an authoritative state land-records database.
 
-> **Important:** DHAROHAR is a prototype using synthetic demonstration data. It is not an official government land-record system, does not establish legal ownership, and is not connected to an authoritative state land-records database.
+## Judge demo access
+
+**Live application:** https://dharohar.urbantechx.in
+
+Dedicated public judge credentials are being provisioned separately from administrator and operational accounts. They will be published here only after the account is verified to be restricted to synthetic demonstration data and does not carry administrator or operational privileges.
+
+Until then, request an evaluation account from the project maintainer. Do not use credentials from other projects or shared internal/demo accounts. See the [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) for the walkthrough and access boundaries.
+
+| Demo role | Username | Password | Access |
+|---|---|---|---|
+| Judge / reviewer | **Pending dedicated account provisioning** | **Will be published after verification** | Restricted synthetic-data demonstration |
+
+**Never publish production administrator credentials, database passwords, JWT signing secrets, private API keys or credentials reused by another project.** The demo is shared infrastructure; use synthetic values only. Do not enter real citizen, officer, identity or land-record data. Please do not perform load tests or authentication-rate testing.
+
+> **Support DHAROHAR:** If you find this project useful, [give the public project repository a star](https://github.com/naamanjain/dharohar). It helps others discover the project and supports the documentation and evaluation work.
 
 ## The problem
 
 A parcel's information can be spread across paper records and separate spatial and mutation registers. Officers may need to transcribe and reconcile the same information repeatedly, while citizens face delays when records disagree. Scanning alone preserves an image but does not make its contents reliably searchable or comparable.
 
+Read the [problem statement](./docs/PROBLEM_STATEMENT.md).
+
 ## The approach
 
-DHAROHAR separates recognition from authoritative assertion:
+DHAROHAR separates recognition from assertion:
 
 1. Ingest a document image or PDF.
 2. Run bundled OCR locally in the browser.
@@ -49,6 +66,8 @@ DHAROHAR separates recognition from authoritative assertion:
 
 OCR output is a draft for review, not a legal determination. Officers must verify and approve information before it is treated as an application record.
 
+Read the [solution overview](./docs/SOLUTION_OVERVIEW.md).
+
 ## Main capabilities
 
 - Hindi/English officer interface.
@@ -59,11 +78,13 @@ OCR output is a draft for review, not a legal determination. Officers must verif
 - District-scoped access and capability-based authorisation.
 - Document management and verification workflows.
 - Dashboard, metrics and audit-trail views.
-- Session revocation on logout.
+- Server-side sign-in challenge and session revocation.
+
+See the [feature matrix](./docs/FEATURES.md) for implementation status and evidence.
 
 ## Architecture
 
-```
+```text
 Browser application
   Hindi/English UI · local OCR · parcel map · review workflows
           │ same-origin authenticated API
@@ -78,46 +99,48 @@ MariaDB (current hosted deployment)
 
 The implementation source is maintained separately in a private development repository. This public repository is intentionally documentation-only; it does not contain the application source code.
 
-## Try the demonstration
-
-Open **https://dharohar.urbantechx.in**.
-
-The application is labelled as a prototype and uses synthetic data. **No production administrator credentials, database credentials, JWT secrets or shared internal passwords are published here.**
-
-If a judge needs an interactive login, request a dedicated demo account from the project administrator. Any account shared for evaluation should be restricted, use synthetic data only, and be separate from administrator and operational accounts. Demo access may be time-limited or disabled after the evaluation.
-
-Please do not run load tests, password spraying or authentication-rate tests against the shared-hosting demonstration.
+Read the [architecture overview](./docs/ARCHITECTURE_OVERVIEW.md).
 
 ## Verification snapshot
 
-The following results are from the project’s recorded live and automated checks; they are not a claim of government certification or production readiness.
+The following results are from the project's dated live and automated checks. They are not a claim of government certification or production readiness.
 
 | Area | Recorded evidence |
 |---|---|
-| Authentication challenge | Server-side challenge, wrong-answer rejection, expiry and replay rejection verified against the deployed API (2026-11-05) |
+| Authentication challenge | Server-issued challenge, wrong-answer rejection, expiry and replay rejection verified against the deployed API (2026-11-05) |
 | Session revocation | Logout invalidates the issued token on subsequent read and write requests |
 | Authorisation | Capability checks and district scoping verified; out-of-scope parcel lookup returns 404 |
 | Database | Read-only MariaDB checks confirmed migration state, document codes, session revocation and audit-chain integrity (2026-11-05) |
-| Audit integrity | 7 entries checked; no null hashes or broken links in that recorded check |
+| Audit integrity | Seven entries checked; no null hashes or broken links in that recorded check |
 | Map boundaries | Backend parcel response includes boundary geometry; polygon selection/edit handles were verified live (2026-11-07) |
-| Automated tests | Recorded passing suites include TypeScript, crypto, CAPTCHA, DTO, tile, i18n, OCR, phase4 and E2E checks; see the dated completion reports in the development project |
+| Automated tests | Recorded passing suites include TypeScript, crypto, CAPTCHA, DTO, tile, i18n, OCR, phase4 and E2E checks; exact dated results and unexecuted gates are documented in [Validation & Evidence](./docs/VALIDATION_AND_EVIDENCE.md) |
 
-### Current limitations and work in progress
+## Limitations and roadmap
 
-- The hosting provider has shown intermittent high first-byte latency and connection failures. Client-side resilience improvements have been implemented in the development build but were still awaiting frontend deployment in the 2026-11-07 checkpoint.
-- Polygon rendering and editing depend on valid boundary geometry. A seeded synthetic parcel has a known discrepancy between its polygon-derived area and its stored mapped-area value; it remains flagged rather than silently altered.
-- A second restricted officer identity is still needed to complete the separate cross-role comparison.
-- The recorded checks do not establish OCR accuracy across real district document formats.
+- No consented real district data has been loaded; semantic reconciliation against actual jamabandi/khasra formats across districts remains future work.
+- A seeded synthetic parcel has a known discrepancy between its polygon-derived area and stored mapped-area value; it remains flagged rather than silently altered.
+- A second restricted officer identity is needed to complete the separate cross-role comparison.
+- Recorded automated OCR tests do not establish accuracy on real district documents.
+- The hosting provider has shown intermittent high first-byte latency and connection failures. Client-side resilience and map-layer performance changes were still awaiting frontend deployment at the 2026-11-07 checkpoint; verify the current live build before treating them as deployed.
 - The prototype has not been reconciled with authoritative government land records and must not be used to make legal or ownership decisions.
 
-## Repository contents
+See [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md).
 
-This repository contains public-facing project documentation only:
+## Documentation
 
-- [Evaluation package](./docs/EVALUATION_PACKAGE.md) — project description, architecture, data model, API overview, security design, testing methodology and limitations.
+| Document | Purpose |
+|---|---|
+| [Project Overview](./docs/PROJECT_OVERVIEW.md) | Purpose, users, operating boundaries and current status |
+| [Problem Statement](./docs/PROBLEM_STATEMENT.md) | Problem context and risks the design avoids |
+| [Solution Overview](./docs/SOLUTION_OVERVIEW.md) | End-to-end workflow and product principles |
+| [Architecture Overview](./docs/ARCHITECTURE_OVERVIEW.md) | Frontend, API, persistence and trust boundaries |
+| [Feature Matrix](./docs/FEATURES.md) | Implemented capabilities and evidence status |
+| [Validation and Evidence](./docs/VALIDATION_AND_EVIDENCE.md) | Dated automated, browser, API and database results |
+| [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md) | Known gaps and responsible next steps |
+| [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) | Judge access and suggested product walkthrough |
+| [Rights Notice](./docs/RIGHTS_NOTICE.md) | Project materials and third-party notices |
+| [Full Evaluation Package](./docs/EVALUATION_PACKAGE.md) | Consolidated evaluation narrative |
 
-No application source, environment files, secrets, database dumps or operational credentials belong in this repository.
+## Rights and third-party notices
 
-## Licence and third-party notices
-
-Project documentation and original project materials are provided under the rights stated by the project author. Third-party libraries, OCR assets, map services and datasets remain subject to their respective licences and attribution requirements. Consult each provider’s current terms before redistribution or production use.
+DHAROHAR's implementation source is not published in this repository. Project documentation and original project materials are reserved by the project author unless stated otherwise. Third-party libraries, OCR assets, map services and datasets remain subject to their respective licences and attribution requirements. See the [Rights Notice](./docs/RIGHTS_NOTICE.md).
