@@ -10,7 +10,7 @@
     <img alt="Star DHAROHAR on GitHub" src="https://img.shields.io/badge/STAR%20THIS%20PROJECT-on%20GitHub-f0b429?style=for-the-badge&logo=github&logoColor=111827" />
   </a>
   &nbsp;
-  <a href="./docs/EVALUATION_PACKAGE.md">
+  <a href="./EVALUATION_PACKAGE.md">
     <img alt="Read the evaluation package" src="https://img.shields.io/badge/READ-EVALUATION%20PACKAGE-475569?style=for-the-badge&logo=readthedocs&logoColor=white" />
   </a>
 </p>
@@ -19,9 +19,9 @@
   <strong>Try the deployed application:</strong>
   <a href="https://dharohar.urbantechx.in">Launch DHAROHAR ↗</a>
   &nbsp;·&nbsp;
-  <a href="./docs/DEMONSTRATION_GUIDE.md">Reviewer walkthrough</a>
+  <a href="./DEMONSTRATION_GUIDE.md">Reviewer walkthrough</a>
   &nbsp;·&nbsp;
-  <a href="./docs/ARCHITECTURE_OVERVIEW.md">Architecture</a>
+  <a href="./ARCHITECTURE_OVERVIEW.md">Architecture</a>
 </p>
 
 **Project status:** deployed prototype on synthetic demonstration data · Hindi and English
@@ -36,7 +36,7 @@ DHAROHAR is a revenue-officer workstation for digitising, checking and reviewing
 
 No dedicated public judge account has been verified yet. Credentials will be published here only after a separate account is provisioned and tested to be restricted to synthetic demonstration data, with no administrator or operational privileges.
 
-Until that verification is complete, request evaluation access from the project maintainer. Do not use credentials from other projects or shared internal/demo accounts. See the [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) for the walkthrough and access boundaries.
+Until that verification is complete, request evaluation access from the project maintainer. Do not use credentials from other projects or shared internal/demo accounts. See the [Demonstration Guide](./DEMONSTRATION_GUIDE.md) for the walkthrough and access boundaries.
 
 | Demo role | Username | Password | Access |
 |---|---|---|---|
@@ -50,7 +50,7 @@ Until that verification is complete, request evaluation access from the project 
 
 A parcel's information can be spread across paper records and separate spatial and mutation registers. Officers may need to transcribe and reconcile the same information repeatedly, while citizens face delays when records disagree. Scanning alone preserves an image but does not make its contents reliably searchable or comparable.
 
-Read the [problem statement](./docs/PROBLEM_STATEMENT.md).
+Read the [problem statement](./PROBLEM_STATEMENT.md).
 
 ## The approach
 
@@ -66,7 +66,7 @@ DHAROHAR separates recognition from assertion:
 
 OCR output is a draft for review, not a legal determination. Officers must verify and approve information before it is treated as an application record.
 
-Read the [solution overview](./docs/SOLUTION_OVERVIEW.md).
+Read the [solution overview](./SOLUTION_OVERVIEW.md).
 
 ## Main capabilities
 
@@ -80,7 +80,7 @@ Read the [solution overview](./docs/SOLUTION_OVERVIEW.md).
 - Dashboard, metrics and audit-trail views.
 - Server-side sign-in challenge and session revocation.
 
-See the [feature matrix](./docs/FEATURES.md) for implementation status and evidence.
+See the [feature matrix](./FEATURES.md) for implementation status and evidence.
 
 ## Architecture
 
@@ -90,7 +90,7 @@ See the [feature matrix](./docs/FEATURES.md) for implementation status and evide
 
 The implementation source is maintained separately in a private development repository. This public repository is intentionally documentation-only; it does not contain the application source code.
 
-Explore the [architecture overview](./docs/ARCHITECTURE_OVERVIEW.md) and [design differentiators](./docs/INNOVATION.md).
+Explore the [architecture overview](./ARCHITECTURE_OVERVIEW.md) and [design differentiators](./INNOVATION.md).
 
 ## Verification snapshot
 
@@ -104,7 +104,7 @@ The following results are from the project's dated live and automated checks. Th
 | Database | Read-only MariaDB checks confirmed migration state, document codes, session revocation and audit-chain integrity (2026-11-05) |
 | Audit integrity | Seven entries checked; no null hashes or broken links in that recorded check |
 | Map boundaries | Backend parcel response includes boundary geometry; polygon selection/edit handles were verified live (2026-11-07) |
-| Automated tests | Recorded passing suites include TypeScript, crypto, CAPTCHA, DTO, tile, i18n, OCR, phase4 and E2E checks; exact dated results and unexecuted gates are documented in [Validation & Evidence](./docs/VALIDATION_AND_EVIDENCE.md) |
+| Automated tests | Recorded passing suites include TypeScript, crypto, CAPTCHA, DTO, tile, i18n, OCR, phase4 and E2E checks; exact dated results and unexecuted gates are documented in [Validation & Evidence](./VALIDATION_AND_EVIDENCE.md) |
 
 ## Product evidence
 
@@ -119,24 +119,24 @@ The architecture and workflow diagrams above are included as vector assets. Prod
 - The hosting provider has shown intermittent high first-byte latency and connection failures. Client-side resilience and map-layer performance changes were still awaiting frontend deployment at the 2026-11-07 checkpoint; verify the current live build before treating them as deployed.
 - The prototype has not been reconciled with authoritative government land records and must not be used to make legal or ownership decisions.
 
-See [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md).
+See [Limitations and Future Scope](./LIMITATIONS_AND_FUTURE_SCOPE.md).
 
 ## Documentation
 
 | Document | Purpose |
 |---|---|
-| [Project Overview](./docs/PROJECT_OVERVIEW.md) | Purpose, users, operating boundaries and current status |
-| [Problem Statement](./docs/PROBLEM_STATEMENT.md) | Problem context and risks the design avoids |
-| [Solution Overview](./docs/SOLUTION_OVERVIEW.md) | End-to-end workflow and product principles |
-| [Architecture Overview](./docs/ARCHITECTURE_OVERVIEW.md) | Frontend, API, persistence and trust boundaries |
-| [Design and Innovation](./docs/INNOVATION.md) | Specific design differentiators and what the prototype does not claim |
-| [Feature Matrix](./docs/FEATURES.md) | Implemented capabilities and evidence status |
-| [Validation and Evidence](./docs/VALIDATION_AND_EVIDENCE.md) | Dated automated, browser, API and database results |
-| [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md) | Known gaps and responsible next steps |
-| [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) | Judge access and suggested product walkthrough |
-| [Rights Notice](./docs/RIGHTS_NOTICE.md) | Project materials and third-party notices |
-| [Full Evaluation Package](./docs/EVALUATION_PACKAGE.md) | Consolidated evaluation narrative |
+| [Project Overview](./PROJECT_OVERVIEW.md) | Purpose, users, operating boundaries and current status |
+| [Problem Statement](./PROBLEM_STATEMENT.md) | Problem context and risks the design avoids |
+| [Solution Overview](./SOLUTION_OVERVIEW.md) | End-to-end workflow and product principles |
+| [Architecture Overview](./ARCHITECTURE_OVERVIEW.md) | Frontend, API, persistence and trust boundaries |
+| [Design and Innovation](./INNOVATION.md) | Specific design differentiators and what the prototype does not claim |
+| [Feature Matrix](./FEATURES.md) | Implemented capabilities and evidence status |
+| [Validation and Evidence](./VALIDATION_AND_EVIDENCE.md) | Dated automated, browser, API and database results |
+| [Limitations and Future Scope](./LIMITATIONS_AND_FUTURE_SCOPE.md) | Known gaps and responsible next steps |
+| [Demonstration Guide](./DEMONSTRATION_GUIDE.md) | Judge access and suggested product walkthrough |
+| [Rights Notice](./RIGHTS_NOTICE.md) | Project materials and third-party notices |
+| [Full Evaluation Package](./EVALUATION_PACKAGE.md) | Consolidated evaluation narrative |
 
 ## Rights and third-party notices
 
-DHAROHAR's implementation source is not published in this repository. Project documentation and original project materials are reserved by the project author unless stated otherwise. Third-party libraries, OCR assets, map services and datasets remain subject to their respective licences and attribution requirements. See the [Rights Notice](./docs/RIGHTS_NOTICE.md).
+DHAROHAR's implementation source is not published in this repository. Project documentation and original project materials are reserved by the project author unless stated otherwise. Third-party libraries, OCR assets, map services and datasets remain subject to their respective licences and attribution requirements. See the [Rights Notice](./RIGHTS_NOTICE.md).
