@@ -1,6 +1,27 @@
 # DHAROHAR · धरोहर
 ## Land Record Digitisation & Verification Portal
 
+<p align="center">
+  <a href="https://dharohar.urbantechx.in">
+    <img alt="Open the live DHAROHAR demo" src="https://img.shields.io/badge/OPEN%20LIVE%20DEMO-dharohar.urbantechx.in-1769aa?style=for-the-badge&logo=googlechrome&logoColor=white" />
+  </a>
+  &nbsp;
+  <a href="https://github.com/naamanjain/dharohar">
+    <img alt="Star DHAROHAR on GitHub" src="https://img.shields.io/badge/STAR%20THIS%20PROJECT-on%20GitHub-f0b429?style=for-the-badge&logo=github&logoColor=111827" />
+  </a>
+  &nbsp;
+  <a href="./docs/EVALUATION_PACKAGE.md">
+    <img alt="Read the evaluation package" src="https://img.shields.io/badge/READ-EVALUATION%20PACKAGE-475569?style=for-the-badge&logo=readthedocs&logoColor=white" />
+  </a>
+</p>
+
+<p align="center">
+  <strong>Try the deployed application:</strong>
+  <a href="https://dharohar.urbantechx.in">Launch DHAROHAR ↗</a>
+  &nbsp;·&nbsp;
+  <a href="./docs/EVALUATION_PACKAGE.md">Explore the architecture and evaluation</a>
+</p>
+
 **Live demonstration:** https://dharohar.urbantechx.in  
 **Project status:** deployed prototype on synthetic data · Hindi and English
 
