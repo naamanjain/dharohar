@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="560" viewBox="0 0 1600 560" role="img" aria-labelledby="title desc">
+<title id="title">DHAROHAR workflow</title>
+<desc id="desc">Document intake moves through local OCR, structured extraction, rule checks, human review and audited verification.</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eaf1fb"/></linearGradient>
+ <filter id="s" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#0f172a" flood-opacity=".1"/></filter>
+ <marker id="a" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto"><path d="M0 0L12 6L0 12Z" fill="#64748b"/></marker>
+ <style>.f{font-family:Inter,system-ui,sans-serif}.title{font-size:34px;font-weight:800;fill:#0f172a}.sub{font-size:17px;fill:#64748b}.h{font-size:18px;font-weight:800}.b{font-size:14px;font-weight:500;fill:#334155}.n{font-size:13px;font-weight:800;letter-spacing:1.2px}</style>
+</defs>
+<rect width="1600" height="560" rx="26" fill="url(#bg)"/>
+<g class="f">
+<text x="70" y="75" class="n" fill="#2563eb">DHAROHAR · END-TO-END REVIEW FLOW</text>
+<text x="70" y="125" class="title">From source document to accountable review</text>
+<text x="70" y="160" class="sub">Each stage preserves the distinction between extracted information and an authorised record.</text>
+<g filter="url(#s)">
+ <rect x="70" y="230" width="210" height="175" rx="18" fill="#fff" stroke="#93c5fd" stroke-width="2"/>
+ <rect x="315" y="230" width="210" height="175" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+ <rect x="560" y="230" width="210" height="175" rx="18" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="2"/>
+ <rect x="805" y="230" width="210" height="175" rx="18" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+ <rect x="1050" y="230" width="210" height="175" rx="18" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+ <rect x="1295" y="230" width="235" height="175" rx="18" fill="#0f172a" stroke="#0f172a" stroke-width="2"/>
+</g>
+<g class="n">
+ <text x="94" y="267" fill="#2563eb">01 · SOURCE</text>
+ <text x="339" y="267" fill="#2563eb">02 · RECOGNISE</text>
+ <text x="584" y="267" fill="#047857">03 · STRUCTURE</text>
+ <text x="829" y="267" fill="#b45309">04 · CHECK</text>
+ <text x="1074" y="267" fill="#6d28d9">05 · REVIEW</text>
+ <text x="1319" y="267" fill="#93c5fd">06 · ATTEST</text>
+</g>
+<g class="h">
+ <text x="94" y="310" fill="#0f172a">Document intake</text>
+ <text x="339" y="310" fill="#0f172a">Local OCR</text>
+ <text x="584" y="310" fill="#0f172a">Revenue fields</text>
+ <text x="829" y="310" fill="#0f172a">Rule validation</text>
+ <text x="1074" y="310" fill="#0f172a">Human decision</text>
+ <text x="1319" y="310" fill="#fff">Audited action</text>
+</g>
+<g class="b">
+ <text x="94" y="345">Image or PDF</text><text x="94" y="368">from a source</text>
+ <text x="339" y="345">Bundled WASM</text><text x="339" y="368">runs in browser</text>
+ <text x="584" y="345">IDs, names, area,</text><text x="584" y="368">shares, mutations</text>
+ <text x="829" y="345">Completeness,</text><text x="829" y="368">shares and area</text>
+ <text x="1074" y="345">Inspect, correct</text><text x="1074" y="368">and decide</text>
+ <text x="1319" y="345" fill="#cbd5e1">Actor, time and</text><text x="1319" y="368" fill="#cbd5e1">integrity history</text>
+</g>
+<g stroke="#64748b" stroke-width="4" fill="none" marker-end="url(#a)">
+ <path d="M282 318H308"/><path d="M527 318H553"/><path d="M772 318H798"/><path d="M1017 318H1043"/><path d="M1262 318H1288"/>
+</g>
+<rect x="70" y="445" width="1460" height="64" rx="14" fill="#dbeafe"/>
+<text x="100" y="472" class="n" fill="#1d4ed8">CONTROL PRINCIPLE</text>
+<text x="100" y="493" class="b" fill="#1e3a8a">OCR suggests. Rules expose inconsistencies. An authorised human decides. The audit trail records the action.</text>
+</g>
+</svg>
