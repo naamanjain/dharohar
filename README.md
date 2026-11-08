@@ -34,9 +34,9 @@ DHAROHAR is a revenue-officer workstation for digitising, checking and reviewing
 
 **Live application:** https://dharohar.urbantechx.in
 
-Dedicated public judge credentials are being provisioned separately from administrator and operational accounts. They will be published here only after the account is verified to be restricted to synthetic demonstration data and does not carry administrator or operational privileges.
+No dedicated public judge account has been verified yet. Credentials will be published here only after a separate account is provisioned and tested to be restricted to synthetic demonstration data, with no administrator or operational privileges.
 
-Until then, request an evaluation account from the project maintainer. Do not use credentials from other projects or shared internal/demo accounts. See the [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) for the walkthrough and access boundaries.
+Until that verification is complete, request evaluation access from the project maintainer. Do not use credentials from other projects or shared internal/demo accounts. See the [Demonstration Guide](./docs/DEMONSTRATION_GUIDE.md) for the walkthrough and access boundaries.
 
 | Demo role | Username | Password | Access |
 |---|---|---|---|
@@ -108,7 +108,7 @@ The following results are from the project's dated live and automated checks. Th
 
 ## Product evidence
 
-The architecture and workflow diagrams above are included as vector assets. Genuine product screenshots are being captured from the deployed application; see the [Screenshot Evidence Pack](./assets/screenshots/README.md). No generated mock screenshots are presented as proof of a live feature.
+The architecture and workflow diagrams above are included as vector assets. Product screenshots have **not yet been added**; the [Screenshot Evidence Pack](./assets/screenshots/README.md) lists the genuine live-interface captures still required. No generated mock screenshots are presented as proof of a live feature.
 
 ## Limitations and roadmap
 
