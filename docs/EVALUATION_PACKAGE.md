@@ -67,33 +67,13 @@ See [Solution Overview](SOLUTION_OVERVIEW.md).
 
 ## 4. System architecture
 
-```mermaid
-flowchart TB
-  subgraph Browser["Browser workstation · React / TypeScript"]
-    UI["Hindi / English interface"]
-    OCR["Bundled WASM OCR"]
-    PARSE["Revenue-field parsing"]
-    RULES["Completeness and arithmetic checks"]
-    MAP["Parcel map and boundary workflows"]
-    REVIEW["Human review and verification"]
-    UI --> OCR --> PARSE --> RULES --> REVIEW
-    UI --> MAP
-  end
-  API["Node.js / TypeScript API"]
-  AUTH["Authentication and principal resolution"]
-  ACCESS["Capabilities and district scoping"]
-  SERVICES["Parcel · document · verification · audit services"]
-  DB[("MariaDB · current hosted deployment")]
-  AUDIT["Hash-linked audit history"]
-  Browser -->|"Authenticated same-origin API"| API
-  API --> AUTH --> ACCESS --> SERVICES
-  SERVICES --> DB
-  SERVICES --> AUDIT
-```
+![DHAROHAR system architecture](../assets/diagrams/dharohar-architecture-overview.svg)
+
+![DHAROHAR end-to-end workflow](../assets/diagrams/dharohar-workflow-overview.svg)
 
 The current hosted deployment uses MariaDB. PostgreSQL/PostGIS is an additional engineering path and is not the active hosted database.
 
-See [Architecture Overview](ARCHITECTURE_OVERVIEW.md).
+See [Architecture Overview](ARCHITECTURE_OVERVIEW.md) and [Design and Innovation](INNOVATION.md).
 
 ## 5. Main modules
 
@@ -233,6 +213,8 @@ This repository is intentionally documentation-only.
 | [Problem Statement](PROBLEM_STATEMENT.md) | Problem context and design risks |
 | [Solution Overview](SOLUTION_OVERVIEW.md) | Workflow and operating principles |
 | [Architecture Overview](ARCHITECTURE_OVERVIEW.md) | Components and trust boundaries |
+| [Design and Innovation](INNOVATION.md) | Design differentiators and explicit non-claims |
+| [Screenshot Evidence Pack](../assets/screenshots/README.md) | Genuine UI captures to be added after live verification |
 | [Features](FEATURES.md) | Feature status matrix |
 | [Validation and Evidence](VALIDATION_AND_EVIDENCE.md) | Dated verification evidence |
 | [Limitations and Future Scope](LIMITATIONS_AND_FUTURE_SCOPE.md) | Known constraints and roadmap |
