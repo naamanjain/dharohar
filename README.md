@@ -4,6 +4,8 @@
 **Live demonstration:** https://dharohar.urbantechx.in  
 **Project status:** deployed prototype on synthetic data · Hindi and English
 
+> **Support DHAROHAR:** If you find this project interesting, please [give the public project repository a star on GitHub](https://github.com/naamanjain/dharohar). It helps others discover the project and supports the documentation/evaluation work.
+
 DHAROHAR is a revenue-officer workstation for digitising, checking and reviewing land-record information. It combines browser-based OCR, structured revenue data, arithmetic validation, parcel boundaries, human review and an auditable record of consequential actions.
 
 > **Important:** DHAROHAR is a prototype using synthetic demonstration data. It is not an official government land-record system, does not establish legal ownership, and is not connected to an authoritative state land-records database.
