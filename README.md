@@ -84,22 +84,13 @@ See the [feature matrix](./docs/FEATURES.md) for implementation status and evide
 
 ## Architecture
 
-```text
-Browser application
-  Hindi/English UI · local OCR · parcel map · review workflows
-          │ same-origin authenticated API
-          ▼
-Node.js / TypeScript API
-  authentication · capabilities · district scoping · validation
-          │
-          ▼
-MariaDB (current hosted deployment)
-  parcels · owners · documents · inspections · audit records
-```
+![DHAROHAR system architecture](./assets/diagrams/dharohar-architecture-overview.svg)
+
+![DHAROHAR end-to-end workflow](./assets/diagrams/dharohar-workflow-overview.svg)
 
 The implementation source is maintained separately in a private development repository. This public repository is intentionally documentation-only; it does not contain the application source code.
 
-Read the [architecture overview](./docs/ARCHITECTURE_OVERVIEW.md).
+Explore the [architecture overview](./docs/ARCHITECTURE_OVERVIEW.md) and [design differentiators](./docs/INNOVATION.md).
 
 ## Verification snapshot
 
@@ -114,6 +105,10 @@ The following results are from the project's dated live and automated checks. Th
 | Audit integrity | Seven entries checked; no null hashes or broken links in that recorded check |
 | Map boundaries | Backend parcel response includes boundary geometry; polygon selection/edit handles were verified live (2026-11-07) |
 | Automated tests | Recorded passing suites include TypeScript, crypto, CAPTCHA, DTO, tile, i18n, OCR, phase4 and E2E checks; exact dated results and unexecuted gates are documented in [Validation & Evidence](./docs/VALIDATION_AND_EVIDENCE.md) |
+
+## Product evidence
+
+The architecture and workflow diagrams above are included as vector assets. Genuine product screenshots are being captured from the deployed application; see the [Screenshot Evidence Pack](./assets/screenshots/README.md). No generated mock screenshots are presented as proof of a live feature.
 
 ## Limitations and roadmap
 
@@ -134,6 +129,7 @@ See [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md).
 | [Problem Statement](./docs/PROBLEM_STATEMENT.md) | Problem context and risks the design avoids |
 | [Solution Overview](./docs/SOLUTION_OVERVIEW.md) | End-to-end workflow and product principles |
 | [Architecture Overview](./docs/ARCHITECTURE_OVERVIEW.md) | Frontend, API, persistence and trust boundaries |
+| [Design and Innovation](./docs/INNOVATION.md) | Specific design differentiators and what the prototype does not claim |
 | [Feature Matrix](./docs/FEATURES.md) | Implemented capabilities and evidence status |
 | [Validation and Evidence](./docs/VALIDATION_AND_EVIDENCE.md) | Dated automated, browser, API and database results |
 | [Limitations and Future Scope](./docs/LIMITATIONS_AND_FUTURE_SCOPE.md) | Known gaps and responsible next steps |
