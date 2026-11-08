@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1040" viewBox="0 0 1600 1040" role="img" aria-labelledby="title desc">
+  <title id="title">DHAROHAR system architecture</title>
+  <desc id="desc">Architecture diagram showing officer browser workstation with local OCR, validation, map and review connected to a Node.js API with authentication and district authorization, backed by MariaDB and a hash-linked audit history.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eaf1fb"/>
+    </linearGradient>
+    <linearGradient id="navy" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0f172a" flood-opacity=".11"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowSlate" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      .font{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+      .eyebrow{font-size:16px;font-weight:700;letter-spacing:2.4px}
+      .h1{font-size:42px;font-weight:800;letter-spacing:-1px}
+      .sub{font-size:19px;font-weight:500}
+      .section{font-size:23px;font-weight:800}
+      .cardTitle{font-size:19px;font-weight:750}
+      .body{font-size:16px;font-weight:500}
+      .small{font-size:14px;font-weight:500}
+      .pill{font-size:13px;font-weight:800;letter-spacing:1px}
+      .muted{fill:#64748b}
+      .white{fill:#fff}
+    </style>
+  </defs>
+  <rect width="1600" height="1040" rx="28" fill="url(#bg)"/>
+  <circle cx="1450" cy="90" r="180" fill="#dbeafe" opacity=".42"/>
+  <circle cx="90" cy="950" r="170" fill="#ccfbf1" opacity=".42"/>
+
+  <g class="font">
+    <text x="92" y="82" class="eyebrow" fill="#2563eb">DHAROHAR · धरोहर</text>
+    <text x="92" y="138" class="h1" fill="#0f172a">System architecture</text>
+    <text x="92" y="176" class="sub muted">Recognition on the client. Authorised assertion on the server. Evidence in the data layer.</text>
+    <rect x="1240" y="62" width="268" height="44" rx="22" fill="#dbeafe"/>
+    <text x="1374" y="90" text-anchor="middle" class="pill" fill="#1d4ed8">PROTOTYPE · SYNTHETIC DATA</text>
+
+    <!-- Browser group -->
+    <rect x="88" y="230" width="1424" height="300" rx="24" fill="#fff" stroke="#cbd5e1" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="88" y="230" width="1424" height="66" rx="24" fill="url(#navy)"/>
+    <path d="M88 272 H1512 V296 H88 Z" fill="url(#navy)"/>
+    <circle cx="126" cy="263" r="7" fill="#60a5fa"/>
+    <circle cx="151" cy="263" r="7" fill="#34d399"/>
+    <circle cx="176" cy="263" r="7" fill="#fbbf24"/>
+    <text x="210" y="270" class="section white">01 · Browser workstation</text>
+    <text x="1464" y="268" text-anchor="end" class="small" fill="#bfdbfe">React · TypeScript · Hindi / English</text>
+
+    <g filter="url(#shadow)">
+      <rect x="126" y="334" width="300" height="144" rx="17" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+      <rect x="448" y="334" width="300" height="144" rx="17" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="2"/>
+      <rect x="770" y="334" width="300" height="144" rx="17" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+      <rect x="1092" y="334" width="382" height="144" rx="17" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+    </g>
+    <text x="154" y="375" class="cardTitle" fill="#1e3a8a">Document intelligence</text>
+    <text x="154" y="407" class="body" fill="#334155">• Intake: image / PDF</text>
+    <text x="154" y="434" class="body" fill="#334155">• Bundled local WASM OCR</text>
+    <text x="154" y="461" class="small" fill="#1d4ed8">No third-party AI upload path</text>
+
+    <text x="476" y="375" class="cardTitle" fill="#065f46">Structured validation</text>
+    <text x="476" y="407" class="body" fill="#334155">• Revenue-field extraction</text>
+    <text x="476" y="434" class="body" fill="#334155">• Shares / area / completeness</text>
+    <text x="476" y="461" class="small" fill="#047857">Discrepancies remain visible</text>
+
+    <text x="798" y="375" class="cardTitle" fill="#92400e">Spatial registry</text>
+    <text x="798" y="407" class="body" fill="#334155">• Parcel geometry and map</text>
+    <text x="798" y="434" class="body" fill="#334155">• Select and edit boundaries</text>
+    <text x="798" y="461" class="small" fill="#b45309">Geometry is not legal proof</text>
+
+    <text x="1120" y="375" class="cardTitle" fill="#5b21b6">Human review &amp; evidence</text>
+    <text x="1120" y="407" class="body" fill="#334155">• Review / field workflows</text>
+    <text x="1120" y="434" class="body" fill="#334155">• Attestation and audit views</text>
+    <text x="1120" y="461" class="small" fill="#6d28d9">Human action remains authoritative</text>
+
+    <!-- API group -->
+    <rect x="88" y="616" width="890" height="270" rx="24" fill="#fff" stroke="#93c5fd" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="88" y="616" width="890" height="64" rx="24" fill="#1d4ed8"/>
+    <path d="M88 654 H978 V680 H88 Z" fill="#1d4ed8"/>
+    <text x="126" y="657" class="section white">02 · Application API</text>
+    <text x="944" y="655" text-anchor="end" class="small" fill="#dbeafe">Node.js · TypeScript · /api</text>
+
+    <rect x="126" y="718" width="238" height="124" rx="15" fill="#eff6ff" stroke="#bfdbfe"/>
+    <rect x="386" y="718" width="238" height="124" rx="15" fill="#eff6ff" stroke="#bfdbfe"/>
+    <rect x="646" y="718" width="294" height="124" rx="15" fill="#eff6ff" stroke="#bfdbfe"/>
+    <text x="150" y="755" class="cardTitle" fill="#1e40af">Identity</text>
+    <text x="150" y="784" class="body" fill="#334155">Authentication</text>
+    <text x="150" y="810" class="body" fill="#334155">Session revocation</text>
+    <text x="410" y="755" class="cardTitle" fill="#1e40af">Authorisation</text>
+    <text x="410" y="784" class="body" fill="#334155">Capabilities and roles</text>
+    <text x="410" y="810" class="body" fill="#334155">District / tenant scope</text>
+    <text x="670" y="755" class="cardTitle" fill="#1e40af">Domain services</text>
+    <text x="670" y="784" class="body" fill="#334155">Parcels · documents · workflow</text>
+    <text x="670" y="810" class="body" fill="#334155">Validation · reports · audit</text>
+
+    <!-- Data group -->
+    <rect x="1040" y="616" width="472" height="270" rx="24" fill="#fff" stroke="#6ee7b7" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="1040" y="616" width="472" height="64" rx="24" fill="#047857"/>
+    <path d="M1040 654 H1512 V680 H1040 Z" fill="#047857"/>
+    <text x="1078" y="657" class="section white">03 · Persistence</text>
+    <text x="1078" y="735" class="cardTitle" fill="#065f46">MariaDB · current hosted store</text>
+    <text x="1078" y="769" class="body" fill="#334155">Parcels · owners · mutations</text>
+    <text x="1078" y="797" class="body" fill="#334155">Documents · inspections · grants</text>
+    <rect x="1078" y="824" width="396" height="38" rx="10" fill="#ecfdf5"/>
+    <text x="1276" y="849" text-anchor="middle" class="small" fill="#047857">Hash-linked audit records</text>
+
+    <!-- arrows -->
+    <path d="M800 530 V574 H530 V610" fill="none" stroke="#2563eb" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrowBlue)"/>
+    <text x="560" y="568" class="small" fill="#1d4ed8">Authenticated API requests</text>
+    <path d="M978 750 H1030" fill="none" stroke="#64748b" stroke-width="5" stroke-linecap="round" marker-end="url(#arrowSlate)"/>
+    <text x="1004" y="733" text-anchor="middle" class="small muted">Scoped writes</text>
+
+    <!-- principles band -->
+    <rect x="88" y="920" width="1424" height="72" rx="18" fill="#0f172a"/>
+    <text x="126" y="950" class="eyebrow" fill="#93c5fd">DESIGN BOUNDARIES</text>
+    <text x="126" y="976" class="body white">OCR suggests · Officer reviews · API authorises · Database persists · Audit history records</text>
+    <text x="1470" y="965" text-anchor="end" class="small" fill="#94a3b8">Independent prototype · synthetic data only</text>
+  </g>
+</svg>
